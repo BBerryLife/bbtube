@@ -108,6 +108,9 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     this->trackpadFocusInSlider = false;
     appSettings = ApplicationUI::appSettings;
     this->remuxSession = 0;
+    this->previewRemuxSession = 0;
+    this->remuxPlaybackStarted = false;
+    this->playingFromPreview = false;
     this->pendingRemuxQualityLabel = "";
 
     root->setLayout(new bb::cascades::DockLayout());
@@ -782,10 +785,27 @@ void PlayerPage::startPlaybackAt(QString url)
     }
 }
 
+// Seconds of preview to remux+play immediately on an initial playback,
+// before the full-length remux finishes -- see playVideoWithRemux() and
+// StreamingRemuxSession's "Preview mode" header comment.
+static const double PREVIEW_DURATION_SECONDS = 15.0;
+
 void PlayerPage::playVideoWithRemux(SingleVideoStorageData videoData)
 {
     pendingRemuxQualityLabel = ""; // "" == this is an initial playback, not a mid-playback quality switch
     startRemuxSession(videoData);
+
+    if (isLiveStream) {
+        return; // no fixed-length preview makes sense for a live stream
+    }
+
+    QString previewPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality + "_preview");
+    previewRemuxSession = new StreamingRemuxSession(ApplicationUI::networkManager, videoData.url,
+            storageData.audio.url, previewPath, this, PREVIEW_DURATION_SECONDS);
+    QObject::connect(previewRemuxSession, SIGNAL(failed(QString)), this,
+            SLOT(onPreviewRemuxFailed(QString)));
+    QObject::connect(previewRemuxSession, SIGNAL(finished()), this, SLOT(onPreviewRemuxFinished()));
+    previewRemuxSession->start();
 }
 
 void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData)
@@ -794,22 +814,35 @@ void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageDa
     startRemuxSession(videoData);
 }
 
-void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
+void PlayerPage::clearRemuxSessions()
 {
-    QString outputPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality);
-
+    // See the comment on this same cancel()/deleteLater() pair further
+    // down (originally in startRemuxSession()) for why cancel() has to
+    // run synchronously before deleteLater() rather than just deleting.
     if (remuxSession) {
-        // cancel() synchronously disconnects and aborts everything so no
-        // slot on the old session can fire again (see its declaration for
-        // why this matters beyond just avoiding a spurious "Source
-        // unavailable" toast -- without it, an in-flight reply's abort()
-        // can synchronously re-enter a slot on a session that's mid-
-        // teardown, which is a use-after-free). deleteLater() then just
-        // handles actual memory reclamation once the event loop gets to it.
         remuxSession->cancel();
         remuxSession->deleteLater();
         remuxSession = 0;
     }
+    if (previewRemuxSession) {
+        previewRemuxSession->cancel();
+        previewRemuxSession->deleteLater();
+        previewRemuxSession = 0;
+    }
+    remuxPlaybackStarted = false;
+    playingFromPreview = false;
+}
+
+void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
+{
+    QString outputPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality);
+
+    // Only ever tears down remuxSession/previewRemuxSession as a PAIR --
+    // starting a fresh remux (new video, or a quality change) always
+    // means any still-running preview for whatever was playing before is
+    // moot too, so this can't leave a stale previewRemuxSession pointed
+    // at the wrong video around. playingFromPreview is reset with it.
+    clearRemuxSessions();
 
     remuxSession = new StreamingRemuxSession(ApplicationUI::networkManager, videoData.url,
             storageData.audio.url, outputPath, this);
@@ -828,8 +861,50 @@ void PlayerPage::onRemuxHeadReady()
     // the player yet: headReady() fires before beginBodyDownloads()/
     // beginFragmentedBodyDownloads() has even been called, so at this
     // point zero bytes of audio or video body have actually been written.
-    // Playback is kicked off later, from onRemuxFinished(), once the
-    // WHOLE file is on disk -- see that function for why.
+    // Playback is kicked off later, from onRemuxFinished()/
+    // onPreviewRemuxFinished(), once the WHOLE file (preview or full) is
+    // on disk -- see onRemuxFinished() for why.
+}
+
+void PlayerPage::onPreviewRemuxFinished()
+{
+    if (!previewRemuxSession) return;
+
+    // Full remux may have already finished and started playback on its
+    // own (fast connection, short video) by the time this fires -- if
+    // so, the preview is moot, just clean it up.
+    if (remuxPlaybackStarted) {
+        previewRemuxSession->deleteLater();
+        previewRemuxSession = 0;
+        return;
+    }
+
+    QString path = previewRemuxSession->outputPath();
+    previewRemuxSession->deleteLater();
+    previewRemuxSession = 0;
+
+    startPlaybackAt(path);
+    remuxPlaybackStarted = true;
+    playingFromPreview = true;
+
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux] preview finished writing, playing from" << path
+             << "while full remux continues";
+#endif
+}
+
+void PlayerPage::onPreviewRemuxFailed(QString errorMessage)
+{
+    // Not fatal -- the full remux is still running and will play once
+    // it's done, same as if there had never been a preview. No toast:
+    // surfacing an error here for something the person didn't ask for
+    // and whose failure is invisible to them (playback just starts a
+    // little later than it could have) would be confusing.
+    qDebug() << "[bbtube][remux] preview failed (non-fatal, waiting for full remux):" << errorMessage;
+    if (previewRemuxSession) {
+        previewRemuxSession->deleteLater();
+        previewRemuxSession = 0;
+    }
 }
 
 void PlayerPage::onRemuxFinished()
@@ -852,15 +927,29 @@ void PlayerPage::onRemuxFinished()
     // before it will open a local file at all. Confirmed in the field --
     // attachInput failed immediately after play(), every time, with the
     // video body only 60-80% downloaded at that point despite audio
-    // having completed seconds earlier.
+    // having completed seconds earlier. (This is also why there's no
+    // attempt to attach mmrenderer directly to the FULL output file
+    // while it's still being written -- see previewRemuxSession instead,
+    // which sidesteps this by remuxing a short, separately-finished file.)
     if (!remuxSession) return;
 
     if (pendingRemuxQualityLabel != "") {
         QString newQuality = pendingRemuxQualityLabel;
         pendingRemuxQualityLabel = "";
         changeQuality(newQuality, remuxSession->outputPath());
+    } else if (playingFromPreview) {
+        // Already playing the preview -- swap the same player instance
+        // over to the full file and resume at the same position, same
+        // mechanism as an ordinary quality change (GlobalPlayerContext::
+        // changeQuality() reads position/state before swapping the
+        // source and restores them after).
+        changeQuality(quality, remuxSession->outputPath());
+        playingFromPreview = false;
     } else {
+        // Preview never got a chance to play from (failed, or lost the
+        // race to the full remux) -- behave exactly as before.
         startPlaybackAt(remuxSession->outputPath());
+        remuxPlaybackStarted = true;
     }
 
 #ifdef QT_DEBUG
@@ -871,13 +960,33 @@ void PlayerPage::onRemuxFinished()
 void PlayerPage::onRemuxFailed(QString errorMessage)
 {
     qDebug() << "[bbtube][remux] failed:" << errorMessage;
-    UIUtils::toastError("Source unavailable");
+    if (!playingFromPreview) {
+        // If the preview is already playing, the person has something
+        // watchable on screen right now -- the full remux failing just
+        // means playback won't extend past the preview's ~15s, which
+        // isn't worth interrupting them with an error toast for. If
+        // nothing has played yet, this is the same failure as before.
+        UIUtils::toastError("Source unavailable");
+    }
     if (remuxSession) {
         remuxSession->deleteLater();
         remuxSession = 0;
     }
+    // A still-running preview is moot without a full remux to hand off
+    // to -- tear it down too, but only if it hasn't already played (if
+    // playingFromPreview is true, previewRemuxSession is already 0 --
+    // see onPreviewRemuxFinished()). Leaves the person stuck at the
+    // preview's ~15s with nowhere further to go, same as any other
+    // failed load past that point.
+    if (previewRemuxSession) {
+        previewRemuxSession->cancel();
+        previewRemuxSession->deleteLater();
+        previewRemuxSession = 0;
+    }
+    remuxPlaybackStarted = playingFromPreview; // preserve "something is already playing" if that's the case
     pendingRemuxQualityLabel = "";
 }
+
 
 QString PlayerPage::remuxOutputPathFor(QString videoId, QString quality)
 {

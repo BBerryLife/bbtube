@@ -35,6 +35,16 @@
 //   // once headReady() fires, session->outputPath() is a valid, playable
 //   // (if still-growing) local MP4 file.
 //
+// Preview mode (maxDurationSeconds > 0, see constructor): truncates each
+// track's fragSamples to just the samples covering the first N seconds
+// (fragmented sources only -- see beginFragmentDiscovery's isFragmented
+// check) before the sample table is built, producing a small, fully
+// self-contained, independently playable MP4 covering only that much of
+// the video. finished() still means "this file, such as it is, is
+// completely written" -- it's just a much shorter file. Used by
+// PlayerPage to get a ~15s preview onto disk (and into the player) fast
+// while the real full-length remux runs alongside it; see
+// PlayerPage::startPreviewThenFullRemux().
 // One contiguous Range request's worth of video-body samples, computed
 // once up front (in dispatch order) so each batch's absolute output
 // offset is known regardless of which order its request actually
@@ -56,7 +66,8 @@ class StreamingRemuxSession: public QObject
 Q_OBJECT
 public:
     StreamingRemuxSession(QNetworkAccessManager *networkManager, const QString &videoUrl,
-            const QString &audioUrl, const QString &outputPath, QObject *parent = 0);
+            const QString &audioUrl, const QString &outputPath, QObject *parent = 0,
+            double maxDurationSeconds = 0.0);
     virtual ~StreamingRemuxSession();
 
     void start();
@@ -112,6 +123,15 @@ private slots:
     void onVideoBodyBatchFinished();
     void onAudioFragBodyFinished();
 
+    // Delayed-retry trampolines: QTimer::singleShot needs a slot to land
+    // in (no lambdas -- this is C++03/gcc 4.6.3), and each one carries
+    // the retry's target via a plain member set right before arming the
+    // timer. See RETRY_DELAY_MS in the .cpp for why retries are delayed
+    // at all instead of firing instantly.
+    void onMoofRetryTimer();
+    void onVideoBodyBatchRetryTimer();
+    void onAudioFragBodyRetryTimer();
+
 private:
     void requestVideoHead();
     void requestAudioHead();
@@ -125,18 +145,42 @@ private:
     void dispatchMoofRequests(bool isVideoTrack); // fills the concurrency window
     void retryMoofRequest(bool isVideoTrack, size_t fragIndex); // re-issues a single fragment after a transient failure
     void onTrackFragmentsReady(bool isVideoTrack);
+    // Preview-mode support: drops every fragSamples entry at/after the
+    // first one whose cumulative duration (in the track's own timescale)
+    // reaches m_maxDurationSeconds, and updates track.duration to match
+    // so the output moov reports the truncated length instead of the
+    // original. No-op if m_maxDurationSeconds <= 0 or the track is
+    // already shorter than that. Called from onTrackFragmentsReady(),
+    // before buildProgressiveTablesFromFragments() -- see the header
+    // comment on "Preview mode" above for why this has to happen before
+    // that call rather than after.
+    void truncateTrackForPreview(TrackHead &track);
 
     // Fragment-by-fragment body streaming helpers (fragmented sources only).
     void beginFragmentedBodyDownloads();
     void requestNextFragBody(bool isVideoTrack); // audio only now -- see class-level comment above onVideoBodyBatchFinished()
+    void requestNextFragBodyImpl(bool isVideoTrack, bool isRetry); // shared by requestNextFragBody() and onAudioFragBodyRetryTimer()
     void buildVideoBodyBatches(); // computes m_videoBodyBatches once, up front
     void dispatchVideoBodyBatches(); // fills the FRAG_BODY_CONCURRENCY window
     void retryVideoBodyBatch(size_t batchIndex); // re-issues a single batch after a transient failure
+
+    // Pending-retry state for the delayed-retry trampolines above --
+    // written right before arming a QTimer::singleShot and read back
+    // when it fires. Only one of each kind is ever pending at a time
+    // per call site (the moof/body-batch code paths retry one
+    // fragment/batch at a time), so a single pair of members per
+    // trampoline is enough.
+    bool m_pendingMoofRetryIsVideo;
+    size_t m_pendingMoofRetryFragIndex;
+    size_t m_pendingVideoBodyRetryBatchIndex;
 
     QNetworkAccessManager *m_networkManager;
     QString m_videoUrl;
     QString m_audioUrl;
     QString m_outputPath;
+    // Preview-mode cap (0 = disabled, full remux as before). See the
+    // "Preview mode" header comment above and truncateTrackForPreview().
+    double m_maxDurationSeconds;
 
     int m_videoHeadFetchSize;
     int m_audioHeadFetchSize;

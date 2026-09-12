@@ -3,10 +3,29 @@
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QVariant>
+#include <QTimer>
 
 #ifdef QT_DEBUG
 #include <QDebug>
 #endif
+
+// Delay, in ms, before re-issuing a request that just failed with a
+// transient network error (dropped/refused connection, timeout). Retrying
+// instantly (the original behaviour) works fine for a genuine one-off
+// packet-loss blip, but does nothing to help the specific failure mode
+// seen in the field: a request reusing a POOLED connection from
+// ApplicationUI::networkManager's shared per-host keep-alive pool that
+// the remote server (or a NAT/proxy in between) silently closed while
+// idle between videos. An instant retry against the same pool just grabs
+// another stale socket (or the same one) and fails again immediately --
+// this is exactly the "Connection closed" -> "Connection refused" ->
+// "Connection refused" -> FAILED sequence seen when switching from one
+// video straight into another. A short delay gives Qt's connection cache
+// a chance to notice the socket is dead and evict it before the retry,
+// and combined with the "Connection: close" header set below (which
+// forces that specific retry off the pool entirely), gives the retry a
+// real chance of succeeding instead of just repeating the same failure.
+static const int RETRY_DELAY_MS = 400;
 
 // How much of each source to fetch first, trying to cover ftyp+moov+sidx in
 // one request. Real YouTube adaptiveFormats moov boxes are typically a few
@@ -89,9 +108,9 @@ static Mp4RemuxBytes qByteArrayToBytes(const QByteArray &arr)
 
 StreamingRemuxSession::StreamingRemuxSession(QNetworkAccessManager *networkManager,
         const QString &videoUrl, const QString &audioUrl, const QString &outputPath,
-        QObject *parent) :
+        QObject *parent, double maxDurationSeconds) :
         QObject(parent), m_networkManager(networkManager), m_videoUrl(videoUrl), m_audioUrl(
-                audioUrl), m_outputPath(outputPath), m_videoHeadFetchSize(
+                audioUrl), m_outputPath(outputPath), m_maxDurationSeconds(maxDurationSeconds), m_videoHeadFetchSize(
                 INITIAL_HEAD_FETCH_BYTES), m_audioHeadFetchSize(INITIAL_HEAD_FETCH_BYTES), m_videoHeadParsed(
                 false), m_audioHeadParsed(false), m_planStarted(false), m_failed(false), m_videoHeadReply(
                 0), m_audioHeadReply(0), m_videoBodyReply(0), m_audioBodyReply(0), m_outputFile(0), m_videoBytesWritten(
@@ -100,7 +119,9 @@ StreamingRemuxSession::StreamingRemuxSession(QNetworkAccessManager *networkManag
                 0), m_audioFragDiscoveryCompleted(0), m_videoBodyDispatchIndex(
                 0), m_videoBodyCompletedCount(0), m_audioFragBodyIndex(
                 0), m_audioFragBodyBatchCount(0), m_audioFragBodyOffsetSoFar(0), m_audioFragBodyReply(
-                0), m_audioFragBodyRetryCount(0), m_videoHeadRetryCount(0), m_audioHeadRetryCount(0)
+                0), m_audioFragBodyRetryCount(0), m_videoHeadRetryCount(0), m_audioHeadRetryCount(
+                0), m_pendingMoofRetryIsVideo(false), m_pendingMoofRetryFragIndex(
+                0), m_pendingVideoBodyRetryBatchIndex(0)
 {
 }
 
@@ -455,6 +476,23 @@ void StreamingRemuxSession::dispatchMoofRequests(bool isVideoTrack)
 // decides whether a further failure retries again or gives up.
 void StreamingRemuxSession::retryMoofRequest(bool isVideoTrack, size_t fragIndex)
 {
+    // Delayed via a timer rather than dispatched immediately -- see
+    // RETRY_DELAY_MS for why (stale pooled connection from
+    // ApplicationUI::networkManager's shared per-host keep-alive pool).
+    // onMoofRetryTimer() does the actual m_networkManager->get() once the
+    // timer fires, reading the target back from these members.
+    m_pendingMoofRetryIsVideo = isVideoTrack;
+    m_pendingMoofRetryFragIndex = fragIndex;
+    QTimer::singleShot(RETRY_DELAY_MS, this, SLOT(onMoofRetryTimer()));
+}
+
+void StreamingRemuxSession::onMoofRetryTimer()
+{
+    if (m_failed) return;
+
+    bool isVideoTrack = m_pendingMoofRetryIsVideo;
+    size_t fragIndex = m_pendingMoofRetryFragIndex;
+
     TrackHead &track = isVideoTrack ? m_videoHead : m_audioHead;
     const std::vector<uint64_t> &offsets = isVideoTrack ? m_videoFragOffsets : m_audioFragOffsets;
     QList<QNetworkReply *> &inFlight = isVideoTrack ? m_videoMoofReplies : m_audioMoofReplies;
@@ -467,6 +505,10 @@ void StreamingRemuxSession::retryMoofRequest(bool isVideoTrack, size_t fragIndex
     QByteArray rangeHeader = "bytes=" + QByteArray::number(qint64(offset)) + "-"
             + QByteArray::number(rangeEnd);
     req.setRawHeader("Range", rangeHeader);
+    // Force this retry off the shared connection pool -- if the original
+    // failure was a stale/half-closed pooled socket, reusing the pool
+    // again here just risks grabbing another dead one (or the same one).
+    req.setRawHeader("Connection", "close");
 
     qDebug() << "[bbtube][remux][debug] retryMoofRequest" << (isVideoTrack ? "video" : "audio")
              << "fragIndex=" << qint64(fragIndex) << "attempt=" << (retryCount + 1)
@@ -606,9 +648,41 @@ void StreamingRemuxSession::onAudioMoofFinished()
     dispatchMoofRequests(false);
 }
 
+// Preview-mode support -- see the header comment on truncateTrackForPreview().
+void StreamingRemuxSession::truncateTrackForPreview(TrackHead &track)
+{
+    if (m_maxDurationSeconds <= 0.0 || track.fragSamples.empty() || track.timescale == 0) {
+        return;
+    }
+
+    uint64_t maxTicks = uint64_t(m_maxDurationSeconds * double(track.timescale));
+    uint64_t cumulative = 0;
+    size_t cutIdx = track.fragSamples.size();
+    for (size_t i = 0; i < track.fragSamples.size(); i++) {
+        cumulative += track.fragSamples[i].duration;
+        if (cumulative >= maxTicks) {
+            cutIdx = i + 1; // keep this sample -- it's the one that crosses the cutoff
+            break;
+        }
+    }
+    if (cutIdx >= track.fragSamples.size()) {
+        return; // track is already shorter than the cap -- nothing to trim
+    }
+
+    track.fragSamples.resize(cutIdx);
+    track.duration = cumulative;
+
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux] preview: truncated" << QString::fromStdString(track.label)
+             << "to" << qint64(cutIdx) << "samples (" << (double(cumulative) / track.timescale)
+             << "s)";
+#endif
+}
+
 void StreamingRemuxSession::onTrackFragmentsReady(bool isVideoTrack)
 {
     TrackHead &track = isVideoTrack ? m_videoHead : m_audioHead;
+    truncateTrackForPreview(track);
     try {
         buildProgressiveTablesFromFragments(track);
     } catch (const std::exception &e) {
@@ -865,6 +939,15 @@ void StreamingRemuxSession::beginFragmentedBodyDownloads()
 // enough that it isn't worth the extra batch-list plumbing.
 void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
 {
+    requestNextFragBodyImpl(isVideoTrack, false);
+}
+
+// isRetry forces the request off the shared connection pool (Connection:
+// close) -- see the comment on RETRY_DELAY_MS for why a retry needs that.
+// Split out from requestNextFragBody() so the normal advancing-forward
+// call site doesn't pay that cost on every batch, only on an actual retry.
+void StreamingRemuxSession::requestNextFragBodyImpl(bool isVideoTrack, bool isRetry)
+{
     (void)isVideoTrack; // always false now; kept in the signature to match the .hpp/dispatchMoofRequests style
 
     if (m_audioFragBodyIndex >= m_audioHead.fragSamples.size()) {
@@ -899,6 +982,9 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
     qint64 rangeEnd = rangeStart + batchBytes - 1;
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(rangeStart) + "-" + QByteArray::number(rangeEnd));
+    if (isRetry) {
+        req.setRawHeader("Connection", "close");
+    }
 
 #ifdef QT_DEBUG
     qDebug() << "[bbtube][remux][debug] dispatchAudioBodyRequest fragIndex=" << qint64(idx)
@@ -909,6 +995,12 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
     QNetworkReply *reply = m_networkManager->get(req);
     m_audioFragBodyReply = reply;
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onAudioFragBodyFinished()));
+}
+
+void StreamingRemuxSession::onAudioFragBodyRetryTimer()
+{
+    if (m_failed) return;
+    requestNextFragBodyImpl(false, true);
 }
 
 // Splits the video track's samples into a fixed list of contiguous-range
@@ -1011,12 +1103,27 @@ void StreamingRemuxSession::dispatchVideoBodyBatches()
 // again or gives up.
 void StreamingRemuxSession::retryVideoBodyBatch(size_t batchIndex)
 {
+    // Delayed via a timer -- see RETRY_DELAY_MS / onMoofRetryTimer() above
+    // for why. onVideoBodyBatchRetryTimer() does the actual dispatch once
+    // the timer fires.
+    m_pendingVideoBodyRetryBatchIndex = batchIndex;
+    QTimer::singleShot(RETRY_DELAY_MS, this, SLOT(onVideoBodyBatchRetryTimer()));
+}
+
+void StreamingRemuxSession::onVideoBodyBatchRetryTimer()
+{
+    if (m_failed) return;
+
+    size_t batchIndex = m_pendingVideoBodyRetryBatchIndex;
     const FragBodyBatch &batch = m_videoBodyBatches[batchIndex];
 
     QNetworkRequest req(QUrl::fromEncoded(m_videoUrl.toUtf8()));
     qint64 rangeEnd = batch.rangeStart + batch.batchBytes - 1;
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(batch.rangeStart) + "-" + QByteArray::number(rangeEnd));
+    // Force this retry off the shared connection pool -- see the same
+    // header in onMoofRetryTimer() above for why.
+    req.setRawHeader("Connection", "close");
 
     qDebug() << "[bbtube][remux][debug] retryVideoBodyBatch batchIndex=" << qint64(batchIndex)
              << "attempt=" << (m_videoBodyRetries[batchIndex] + 1) << "of" << BODY_MAX_RETRIES
@@ -1122,7 +1229,7 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
             qDebug() << "[bbtube][remux] audio body batch at" << qint64(m_audioFragBodyIndex)
                      << "failed (" << msg << ") - retrying, attempt" << m_audioFragBodyRetryCount
                      << "of" << BODY_MAX_RETRIES;
-            requestNextFragBody(false);
+            QTimer::singleShot(RETRY_DELAY_MS, this, SLOT(onAudioFragBodyRetryTimer()));
             return;
         }
         failWith(QString("audio fragment sample download failed after %1 retries: %2").arg(
@@ -1143,7 +1250,7 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
                      << "size mismatch (expected" << expectedBytes << "got" << body.size()
                      << ") - relay may not have honored the Range request, retrying, attempt"
                      << m_audioFragBodyRetryCount << "of" << BODY_MAX_RETRIES;
-            requestNextFragBody(false);
+            QTimer::singleShot(RETRY_DELAY_MS, this, SLOT(onAudioFragBodyRetryTimer()));
             return;
         }
         failWith(QString("audio sample batch at %1 (%2 samples) size mismatch: expected %3, "

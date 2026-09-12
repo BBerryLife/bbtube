@@ -91,6 +91,8 @@ private slots:
     void onRemuxHeadReady();
     void onRemuxFailed(QString errorMessage);
     void onRemuxFinished();
+    void onPreviewRemuxFailed(QString errorMessage);
+    void onPreviewRemuxFinished();
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -139,6 +141,27 @@ private:
     QString nextVideoId;
     QString prevVideoId;
     StreamingRemuxSession *remuxSession;
+    // Short (~15s) standalone preview remux, started alongside remuxSession
+    // on an INITIAL playback only (not a mid-playback quality change --
+    // see playVideoWithRemux() vs changeQualityWithRemux()) so something
+    // is watchable fast instead of waiting for the whole video to remux.
+    // 0 once its job is done (played from, or made moot by remuxSession
+    // finishing first) or on any teardown path (see clearRemuxSessions()).
+    StreamingRemuxSession *previewRemuxSession;
+    // True once ANY playback (from the preview file or the full file)
+    // has started for the current playVideoWithRemux() call -- lets
+    // onPreviewRemuxFinished() detect "the full remux already finished
+    // and started playback first" (fast connection/short video) and
+    // skip starting a second, redundant playback from the now-pointless
+    // preview file.
+    bool remuxPlaybackStarted;
+    // True once playback specifically started FROM the preview file
+    // (implies remuxPlaybackStarted) -- tells onRemuxFinished()
+    // (remuxSession's, the full one) to swap the already-playing player
+    // over to the full file via playerContext->changeQuality()
+    // (position-preserving) instead of starting fresh playback via
+    // startPlaybackAt().
+    bool playingFromPreview;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
     void playVideo();
@@ -152,6 +175,7 @@ private:
     void playVideoWithRemux(SingleVideoStorageData videoData);
     void changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData);
     void startRemuxSession(SingleVideoStorageData videoData);
+    void clearRemuxSessions(); // cancels+deletes remuxSession and previewRemuxSession, if present; resets playingFromPreview
     QString remuxOutputPathFor(QString videoId, QString quality);
     int getIndexOfDefaultQuality();
     QString getScalingMethodString(bb::cascades::ScalingMethod::Type type);
