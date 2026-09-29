@@ -235,7 +235,16 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
     if (tfhdFlags & 0x000008) { defaultSampleDuration = rd32(tp + tOff); tOff += 4; }
     uint32_t defaultSampleSize = 0;
     if (tfhdFlags & 0x000010) { defaultSampleSize = rd32(tp + tOff); tOff += 4; }
-    if (tfhdFlags & 0x000020) { tOff += 4; } // default_sample_flags
+    // sample_is_non_sync_sample is bit 0x00010000 of a sample_flags word;
+    // a sample is a sync sample (keyframe) when that bit is CLEAR. Kept as
+    // "defaultSampleIsSync" (already inverted) so every place below just
+    // ORs bits together without re-deriving the polarity each time.
+    bool defaultSampleIsSync = true; // used only if tfhd sets default_sample_flags
+    if (tfhdFlags & 0x000020) {
+        uint32_t defaultSampleFlags = rd32(tp + tOff);
+        defaultSampleIsSync = (defaultSampleFlags & 0x00010000u) == 0;
+        tOff += 4;
+    }
 
     // moof's total byte length -- needed because trun's data_offset (when
     // data-offset-present) is relative to the moof's start, and the mdat
@@ -256,7 +265,14 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
     rOff += 4;
     int64_t dataOffset = 0;
     if (trunFlags & 0x000001) { dataOffset = int32_t(rd32(rp + rOff)); rOff += 4; }
-    if (trunFlags & 0x000004) { rOff += 4; } // first_sample_flags
+    bool haveFirstSampleFlags = false;
+    bool firstSampleIsSync = true;
+    if (trunFlags & 0x000004) {
+        uint32_t firstSampleFlags = rd32(rp + rOff);
+        firstSampleIsSync = (firstSampleFlags & 0x00010000u) == 0;
+        haveFirstSampleFlags = true;
+        rOff += 4;
+    }
 
     // Running byte cursor for this trun's samples. If data-offset-present,
     // it's relative to the moof's start (i.e. fragmentStartOffset); else
@@ -280,12 +296,26 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
         uint32_t sampleSize = defaultSampleSize;
         if (trunFlags & 0x000100) { sampleDuration = rd32(rp + rOff); rOff += 4; }
         if (trunFlags & 0x000200) { sampleSize = rd32(rp + rOff); rOff += 4; }
-        if (trunFlags & 0x000400) { rOff += 4; } // sample_flags
+        bool sampleIsSync = defaultSampleIsSync; // tfhd default, if any (else true)
+        if (trunFlags & 0x000400) {
+            // Per-sample flags present: this OVERRIDES first_sample_flags
+            // and the tfhd default for this sample, per spec.
+            uint32_t sampleFlags = rd32(rp + rOff);
+            sampleIsSync = (sampleFlags & 0x00010000u) == 0;
+            rOff += 4;
+        } else if (i == 0 && haveFirstSampleFlags) {
+            // first_sample_flags only applies when trun does NOT also
+            // carry per-sample flags (the common case: encoders use
+            // first_sample_flags to mark sample 0 as sync while every
+            // other sample in the trun defaults to non-sync).
+            sampleIsSync = firstSampleIsSync;
+        }
         if (trunFlags & 0x000800) { rOff += 4; } // sample_composition_time_offset
 
         s.offsetInSource = sampleCursor;
         s.size = sampleSize;
         s.duration = sampleDuration;
+        s.isSync = sampleIsSync;
         out.push_back(s);
 
         sampleCursor += sampleSize;
@@ -371,6 +401,139 @@ void buildProgressiveTablesFromFragments(TrackHead &track) {
     for (size_t i = 0; i < samples.size(); i++) total += samples[i].size;
     track.mdatDeclaredSize = total;
     track.mdatBodyOffsetInSource = size_t(samples[0].offsetInSource);
+}
+
+// --- Segmented playback support ---------------------------------------
+
+std::vector<VideoSegmentBounds> planVideoSegments(const TrackHead &video,
+                                                   uint64_t targetDurationTicks) {
+    if (video.fragSamples.empty())
+        throw std::runtime_error(video.label + ": planVideoSegments called with no samples");
+
+    const std::vector<FragSample> &samples = video.fragSamples;
+
+    // Running start time of each sample, in the video track's timescale.
+    // Computed once up front rather than repeatedly summing durations
+    // inside the segment-boundary search below.
+    std::vector<uint64_t> startTimes(samples.size());
+    uint64_t t = 0;
+    for (size_t i = 0; i < samples.size(); i++) {
+        startTimes[i] = t;
+        t += samples[i].duration;
+    }
+    uint64_t totalDuration = t;
+
+    std::vector<VideoSegmentBounds> segments;
+    size_t segStart = 0;
+    if (!samples[segStart].isSync) {
+        // Malformed/unusual source whose very first sample isn't marked
+        // sync. Look for the first real sync sample and start there --
+        // there is no valid way to build a standalone, decodable segment
+        // beginning before a keyframe, so any leading non-sync samples
+        // are simply unplayable and dropped from segment 0.
+        size_t firstSync = segStart;
+        while (firstSync < samples.size() && !samples[firstSync].isSync) firstSync++;
+        if (firstSync >= samples.size())
+            throw std::runtime_error(video.label +
+                    ": planVideoSegments found no sync sample anywhere in the track");
+        segStart = firstSync;
+    }
+
+    while (segStart < samples.size()) {
+        uint64_t segStartTime = startTimes[segStart];
+        uint64_t targetEndTime = segStartTime + targetDurationTicks;
+
+        // Advance until duration-so-far reaches the target, then keep
+        // advancing (if needed) to the next sync sample -- segments must
+        // never end mid-GOP, so overshoot the target rather than cut
+        // before a keyframe.
+        size_t i = segStart + 1;
+        while (i < samples.size() && startTimes[i] < targetEndTime) i++;
+        while (i < samples.size() && !samples[i].isSync) i++;
+        // i now points at either: the first sync sample at/after the
+        // target duration, or samples.size() (this is the final segment).
+
+        VideoSegmentBounds b;
+        b.startSampleIndex = segStart;
+        b.endSampleIndex = i;
+        b.startTime = segStartTime;
+        b.endTime = (i < samples.size()) ? startTimes[i] : totalDuration;
+        segments.push_back(b);
+
+        segStart = i;
+    }
+    return segments;
+}
+
+AudioSegmentBounds matchAudioSegment(const VideoSegmentBounds &bounds, uint32_t videoTimescale,
+                                      const TrackHead &video, const TrackHead &audio,
+                                      bool isLastVideoSegment) {
+    (void)video; // kept in the signature for symmetry/future use; unused today
+    if (audio.fragSamples.empty())
+        throw std::runtime_error(audio.label + ": matchAudioSegment called with no samples");
+    if (audio.timescale == 0 || videoTimescale == 0)
+        throw std::runtime_error(audio.label + ": matchAudioSegment given a zero timescale");
+
+    const std::vector<FragSample> &aSamples = audio.fragSamples;
+
+    // Convert the video segment's [startTime, endTime) -- in the VIDEO
+    // timescale -- into the AUDIO timescale via seconds, so the two
+    // tracks' sample tables (which almost never share a timescale; e.g.
+    // 30000 for video vs 48000 for audio) line up on wall-clock time
+    // rather than raw tick counts.
+    double startSeconds = double(bounds.startTime) / double(videoTimescale);
+    double endSeconds   = double(bounds.endTime)   / double(videoTimescale);
+    uint64_t audioStartTicks = uint64_t(startSeconds * double(audio.timescale) + 0.5);
+    uint64_t audioEndTicks   = uint64_t(endSeconds   * double(audio.timescale) + 0.5);
+
+    // Running audio start times, same approach as planVideoSegments.
+    std::vector<uint64_t> startTimes(aSamples.size());
+    uint64_t t = 0;
+    for (size_t i = 0; i < aSamples.size(); i++) {
+        startTimes[i] = t;
+        t += aSamples[i].duration;
+    }
+
+    AudioSegmentBounds out;
+    out.startSampleIndex = 0;
+    while (out.startSampleIndex < aSamples.size()
+            && startTimes[out.startSampleIndex] < audioStartTicks) {
+        out.startSampleIndex++;
+    }
+    if (isLastVideoSegment) {
+        out.endSampleIndex = aSamples.size();
+    } else {
+        out.endSampleIndex = out.startSampleIndex;
+        while (out.endSampleIndex < aSamples.size()
+                && startTimes[out.endSampleIndex] < audioEndTicks) {
+            out.endSampleIndex++;
+        }
+        // Degenerate case: rounding put start==end (segment shorter than
+        // one audio sample, extremely unlikely at ~5s target durations
+        // but guarded against so no segment ever ships with zero audio
+        // samples and silently desyncs). Take at least one sample.
+        if (out.endSampleIndex == out.startSampleIndex && out.startSampleIndex < aSamples.size())
+            out.endSampleIndex = out.startSampleIndex + 1;
+    }
+    return out;
+}
+
+TrackHead sliceTrackHeadForSegment(const TrackHead &source, size_t startIdx, size_t endIdx) {
+    if (startIdx >= endIdx)
+        throw std::runtime_error(source.label + ": sliceTrackHeadForSegment given an empty range");
+    if (endIdx > source.fragSamples.size())
+        throw std::runtime_error(source.label + ": sliceTrackHeadForSegment range exceeds fragSamples");
+
+    // Copy every static field verbatim -- these describe the CODEC/track
+    // identity and are identical for every segment of the same source
+    // track, only the sample-table boxes (rebuilt below) and mdat sizing
+    // differ per segment.
+    TrackHead seg = source;
+    seg.fragSamples.assign(source.fragSamples.begin() + startIdx,
+                            source.fragSamples.begin() + endIdx);
+
+    buildProgressiveTablesFromFragments(seg);
+    return seg;
 }
 
 // Rebuilds an ftyp box, swapping the major_brand to "isom" (the standard

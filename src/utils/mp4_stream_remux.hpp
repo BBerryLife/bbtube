@@ -58,7 +58,17 @@ struct FragSample {
     uint64_t offsetInSource; // absolute byte offset in the source resource
     uint32_t size;
     uint32_t duration;       // in the track's timescale
-    FragSample() : offsetInSource(0), size(0), duration(0) {}
+    // True for a sync sample (keyframe) -- decoded from this sample's
+    // sample_flags (trun per-sample flags if present, else tfhd's
+    // default_sample_flags, else trun's first_sample_flags for sample 0).
+    // Per ISO/IEC 14496-12 8.8.3.1, bit 0x00010000 of sample_flags is
+    // sample_is_non_sync_sample; a sample is a sync sample when that bit
+    // is 0. Audio tracks have no concept of non-sync samples -- every
+    // audio sample is always treated as sync (true) regardless of what
+    // parseMoofSamples() read, since segment cut points only need to
+    // land on VIDEO keyframes; splitting audio anywhere is fine.
+    bool isSync;
+    FragSample() : offsetInSource(0), size(0), duration(0), isSync(true) {}
 };
 
 // Metadata for one track (video-only or audio-only source),
@@ -175,6 +185,65 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
 // non-empty and in playback order). Leaves everything else in `track`
 // untouched. Throws std::runtime_error on empty fragSamples.
 void buildProgressiveTablesFromFragments(TrackHead &track);
+
+// --- Segmented playback support (HLS-style: many small standalone MP4s) ---
+//
+// One [startSampleIndex, endSampleIndex) half-open range into a video
+// TrackHead's fragSamples, marking one playback segment. Always starts on
+// a sync sample (keyframe) except possibly segment 0 if the source's very
+// first sample somehow isn't sync (rare/malformed source -- handled by
+// just using sample 0 as-is rather than producing an empty first segment).
+struct VideoSegmentBounds {
+    size_t startSampleIndex;
+    size_t endSampleIndex;   // exclusive
+    uint64_t startTime;      // in video track's timescale, == fragSamples[startSampleIndex]'s running start time
+    uint64_t endTime;        // exclusive, same units
+};
+
+// Cuts video.fragSamples into segments of approximately targetDurationTicks
+// each (in the VIDEO track's timescale -- e.g. targetDurationSeconds *
+// video.timescale), with every segment boundary landing exactly on a sync
+// sample (video.fragSamples[i].isSync == true). A segment only ends once
+// duration-so-far reaches the target AND the next available sample is a
+// sync sample; if keyframes are sparser than the target, segments will run
+// longer than requested rather than split mid-GOP. The final segment
+// always runs to the end of fragSamples, however short. Throws
+// std::runtime_error if video.fragSamples is empty, or if
+// video.fragSamples[0].isSync is false and no later sync sample exists
+// (degenerate/undecodable source -- there would be no valid segment start
+// anywhere).
+std::vector<VideoSegmentBounds> planVideoSegments(const TrackHead &video,
+                                                   uint64_t targetDurationTicks);
+
+// Given VideoSegmentBounds (in the video track's timescale) and an audio
+// TrackHead, returns the [startSampleIndex, endSampleIndex) slice of
+// audio.fragSamples whose time range best covers the same wall-clock
+// window as the video segment -- converting between the two tracks'
+// timescales internally. Audio has no sync-sample constraint (any sample
+// boundary is a valid cut point), so this simply finds the audio samples
+// whose start time falls within [bounds.startTime, bounds.endTime) when
+// both are expressed in seconds. The LAST audio segment (i.e. when
+// bounds.endSampleIndex == video.fragSamples.size()) always extends to
+// the end of audio.fragSamples, so no audio is ever dropped at the very
+// end of the video due to rounding.
+struct AudioSegmentBounds {
+    size_t startSampleIndex;
+    size_t endSampleIndex; // exclusive
+};
+AudioSegmentBounds matchAudioSegment(const VideoSegmentBounds &bounds, uint32_t videoTimescale,
+                                      const TrackHead &video, const TrackHead &audio,
+                                      bool isLastVideoSegment);
+
+// Builds a standalone TrackHead for one segment: copies every static field
+// from `source` (tkhd/mdhd/hdlr/stsd/ftyp/timescale/isVideo/label/etc) but
+// replaces fragSamples with source.fragSamples[startIdx..endIdx), then
+// calls buildProgressiveTablesFromFragments() on the result so its
+// stts/stsz/stco/etc describe ONLY this segment's samples, addressed as if
+// they started fresh (sample table offsets are still the original absolute
+// source byte offsets -- planStreamingRemux() / body-streaming callers are
+// unaffected by this being a sub-range). Throws std::runtime_error if
+// startIdx >= endIdx or endIdx > source.fragSamples.size().
+TrackHead sliceTrackHeadForSegment(const TrackHead &source, size_t startIdx, size_t endIdx);
 
 // Creates/truncates outputPath, resizes it to plan.totalOutputSize, and
 // writes plan.headBytes at offset 0. After this call the file is
