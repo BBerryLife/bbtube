@@ -47,9 +47,10 @@ struct SidxEntry {
 // fragments that follow it.
 struct SidxInfo {
     size_t firstFragmentOffset; // absolute byte offset in the source resource
+    uint32_t timescale;         // ticks/second for SidxEntry::subsegmentDuration
     std::vector<SidxEntry> entries;
     bool found;
-    SidxInfo() : firstFragmentOffset(0), found(false) {}
+    SidxInfo() : firstFragmentOffset(0), timescale(0), found(false) {}
 };
 
 // One decoded sample (from a 'trun' box) with its absolute byte offset
@@ -68,7 +69,13 @@ struct FragSample {
     // parseMoofSamples() read, since segment cut points only need to
     // land on VIDEO keyframes; splitting audio anywhere is fine.
     bool isSync;
-    FragSample() : offsetInSource(0), size(0), duration(0), isSync(true) {}
+    // trun sample_composition_time_offset (PTS - DTS, in the track's
+    // timescale; signed when trun version == 1). 0 when the trun carries
+    // none. Needed to rebuild 'ctts' -- without it, H.264 streams that use
+    // B-frames end up with PTS == DTS in the remuxed file.
+    int32_t compositionOffset;
+    FragSample() : offsetInSource(0), size(0), duration(0), isSync(true),
+                   compositionOffset(0) {}
 };
 
 // Metadata for one track (video-only or audio-only source),
@@ -257,5 +264,63 @@ bool preallocateAndWriteHead(const std::string &outputPath, const RemuxPlan &pla
 // as chunks of a track's body arrive over the network.
 bool writeBodyChunk(const std::string &outputPath, uint64_t outputOffset,
                      const uint8_t *data, size_t len, std::string *errorOut);
+
+
+// --- Partial remux (chunked / progressive playback) -----------------------
+//
+// Builds the complete head (ftyp + moov + mdat header) of a *valid, fully
+// self-contained* MP4 that covers only the first videoSampleCount samples of
+// videoSrc.fragSamples and the first audioSampleCount samples of
+// audioSrc.fragSamples. Neither source is modified.
+//
+// Output layout is the same as planStreamingRemux(): [head][audio body]
+// [video body], where "audio body" is the byte-wise concatenation of the
+// first audioSampleCount samples' payloads in playback order (no gaps) and
+// likewise for video. mvhd/mdhd/tkhd durations are set from the samples that
+// are actually included, so the file reports its true (partial) length.
+//
+// Both counts must be >= 1 and <= the respective fragSamples.size().
+bool planPartialRemux(const TrackHead &videoSrc, const TrackHead &audioSrc,
+                       size_t videoSampleCount, size_t audioSampleCount,
+                       RemuxPlan *outPlan, std::string *errorOut);
+
+// Groups a video sidx's fragments into chunks of at least targetSeconds
+// each (a chunk is a run of whole fragments; fragments are keyframe-aligned
+// GOPs, so every chunk starts on a keyframe). No network access needed --
+// only the sidx timing. The last chunk may be shorter. Returns an empty
+// vector if sidx has no entries or no timescale.
+struct ChunkPlanEntry {
+    size_t fragStart;   // first fragment index (inclusive)
+    size_t fragEnd;     // last fragment index (exclusive)
+    double startSec;
+    double endSec;
+};
+std::vector<ChunkPlanEntry> planChunksFromSidx(const SidxInfo &videoSidx, double targetSeconds);
+
+// Cumulative start time (seconds) of each fragment in a sidx, plus one
+// extra trailing entry == total duration. size() == entries.size() + 1.
+std::vector<double> sidxFragmentStartSeconds(const SidxInfo &sidx);
+
+// Sanity check for the bytes of H.264 samples that were fetched with
+// several parallel Range requests: walks each sample's length-prefixed NAL
+// units (length field size taken from the track's avcC box) and checks they
+// add up to exactly the sample size. Catches a relay answering a Range
+// request with the right number of bytes but the wrong bytes -- the only
+// failure a plain length check cannot see. Returns true when everything is
+// consistent OR when the check does not apply (non-AVC track, unknown
+// length-field size); `data` is the contiguous concatenation of the
+// samples in `samples[0..count)`.
+bool verifyAvcSamples(const TrackHead &track, const std::vector<FragSample> &samples,
+                       size_t firstIdx, size_t count, const uint8_t *data, size_t dataLen);
+
+// Same idea for raw AAC ('mp4a') audio, where there is no NAL structure to
+// walk: every raw_data_block starts with a 3-bit syntax-element id, and id 7
+// (ID_END) as the very first element only ever appears in tiny (<= 2 byte)
+// silent frames. Random/mixed-up bytes violate that in ~1 of 8 frames, so a
+// whole chunk (dozens to hundreds of frames) of wrong data is caught with
+// near certainty while genuine AAC never trips it. Returns true when the
+// track is not AAC.
+bool verifyAacSamples(const TrackHead &track, const std::vector<FragSample> &samples,
+                       size_t firstIdx, size_t count, const uint8_t *data, size_t dataLen);
 
 #endif /* MP4_STREAM_REMUX_HPP_ */

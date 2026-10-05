@@ -22,6 +22,9 @@
 #include "src/utils/VideoViewedPercentProxy.hpp"
 
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
 #include <QRegExp>
 
 #include <bb/cascades/Page>
@@ -108,9 +111,12 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     this->trackpadFocusInSlider = false;
     appSettings = ApplicationUI::appSettings;
     this->remuxSession = 0;
-    this->previewRemuxSession = 0;
+    this->retiringRemuxSession = 0;
     this->remuxPlaybackStarted = false;
-    this->playingFromPreview = false;
+    this->remuxPlayableSeconds = 0;
+    this->playingPartialRemux = false;
+    this->remuxSeekTargetMs = 0;
+    this->remuxStallToastShown = false;
     this->pendingRemuxQualityLabel = "";
 
     root->setLayout(new bb::cascades::DockLayout());
@@ -576,8 +582,17 @@ void PlayerPage::onMediaStateChanged(bb::multimedia::MediaState::Type state)
         // onPlayActionItemClick already updates the button for a user
         // pause) so a pause/hiccup mid-video doesn't jump to another video.
         unsigned int positionMs = playerContext->getPosition();
-        bool reachedEnd = !isLiveStream && duration > 0
+        bool reachedEnd = !isLiveStream && duration > 0 && !playingPartialRemux
                 && positionMs >= (unsigned int) (duration * 1000 - 1500);
+
+        if (playingPartialRemux && !isLiveStream && !remuxStallToastShown
+                && positionMs / 1000.0 >= remuxPlayableSeconds - 2.5) {
+            // Ran out of downloaded data; playback resumes by itself when
+            // the next merged file is swapped in.
+            remuxStallToastShown = true;
+            UIUtils::toastInfo("Buffering...");
+            maybeRequestRemuxMerge();
+        }
 
         if (reachedEnd) {
             if (appSettings->isAutoplay() || playerContext->getPlaylistId() > 0) {
@@ -762,6 +777,7 @@ void PlayerPage::playVideo()
 
 void PlayerPage::startPlaybackAt(QString url)
 {
+    playingPartialRemux = false; // callers that play a partial merged file set it afterwards
     bb::multimedia::MediaError::Type error = playerContext->play(url);
     if (error == bb::multimedia::MediaError::None) {
         addToHistory();
@@ -785,27 +801,17 @@ void PlayerPage::startPlaybackAt(QString url)
     }
 }
 
-// Seconds of preview to remux+play immediately on an initial playback,
-// before the full-length remux finishes -- see playVideoWithRemux() and
-// StreamingRemuxSession's "Preview mode" header comment.
-static const double PREVIEW_DURATION_SECONDS = 15.0;
+// How close (seconds) the player may get to the end of the file it has
+// loaded before the next, longer merged file is requested.
+static const double REMUX_SWAP_LEAD_SECONDS = 10.0;
+// A quality switch only takes over once the new file reaches this far past
+// the current position (so the switch doesn't immediately run dry).
+static const double REMUX_QUALITY_SWITCH_AHEAD_SECONDS = 8.0;
 
 void PlayerPage::playVideoWithRemux(SingleVideoStorageData videoData)
 {
     pendingRemuxQualityLabel = ""; // "" == this is an initial playback, not a mid-playback quality switch
     startRemuxSession(videoData);
-
-    if (isLiveStream) {
-        return; // no fixed-length preview makes sense for a live stream
-    }
-
-    QString previewPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality + "_preview");
-    previewRemuxSession = new StreamingRemuxSession(ApplicationUI::networkManager, videoData.url,
-            storageData.audio.url, previewPath, this, PREVIEW_DURATION_SECONDS);
-    QObject::connect(previewRemuxSession, SIGNAL(failed(QString)), this,
-            SLOT(onPreviewRemuxFailed(QString)));
-    QObject::connect(previewRemuxSession, SIGNAL(finished()), this, SLOT(onPreviewRemuxFinished()));
-    previewRemuxSession->start();
 }
 
 void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData)
@@ -816,187 +822,259 @@ void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageDa
 
 void PlayerPage::clearRemuxSessions()
 {
-    // See the comment on this same cancel()/deleteLater() pair further
-    // down (originally in startRemuxSession()) for why cancel() has to
-    // run synchronously before deleteLater() rather than just deleting.
+    // cancel() has to run synchronously before deleteLater(): it aborts the
+    // in-flight replies and disconnects them from the session, so no slot
+    // can fire into a half-destroyed object.
     if (remuxSession) {
+        QObject::disconnect(remuxSession, 0, this, 0);
         remuxSession->cancel();
         remuxSession->deleteLater();
         remuxSession = 0;
     }
-    if (previewRemuxSession) {
-        previewRemuxSession->cancel();
-        previewRemuxSession->deleteLater();
-        previewRemuxSession = 0;
+    if (retiringRemuxSession) {
+        QObject::disconnect(retiringRemuxSession, 0, this, 0);
+        retiringRemuxSession->cancel();
+        retiringRemuxSession->deleteLater();
+        retiringRemuxSession = 0;
     }
     remuxPlaybackStarted = false;
-    playingFromPreview = false;
+    remuxPlayableSeconds = 0;
+    playingPartialRemux = false;
+    remuxSeekTargetMs = 0;
+    remuxStallToastShown = false;
+}
+
+// Drops merged/staging files nobody will need again (this app never cleaned
+// remux_cache before; a single video is tens of MB).
+static void cleanupRemuxCache(const QString &dirPath)
+{
+    QDir dir(dirPath);
+    QFileInfoList files = dir.entryInfoList(QDir::Files);
+    QDateTime cutoff = QDateTime::currentDateTime().addDays(-1);
+    for (int i = 0; i < files.size(); i++) {
+        if (files[i].lastModified() < cutoff) {
+            QFile::remove(files[i].absoluteFilePath());
+        }
+    }
 }
 
 void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
 {
-    QString outputPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality);
+    QString base = remuxBaseNameFor(videoMetadata.video.videoId, videoData.quality);
+    QString cacheDir = remuxCacheDir();
+    cleanupRemuxCache(cacheDir);
 
-    // Only ever tears down remuxSession/previewRemuxSession as a PAIR --
-    // starting a fresh remux (new video, or a quality change) always
-    // means any still-running preview for whatever was playing before is
-    // moot too, so this can't leave a stale previewRemuxSession pointed
-    // at the wrong video around. playingFromPreview is reset with it.
-    clearRemuxSessions();
+    if (pendingRemuxQualityLabel != "" && remuxSession && !remuxSession->hasFailed()
+            && !remuxSession->isDownloadComplete()) {
+        // Mid-playback quality switch while the current quality's file is
+        // still growing: keep that session alive (it feeds the file the
+        // player is reading) until the new quality's first file takes over.
+        if (retiringRemuxSession) {
+            QObject::disconnect(retiringRemuxSession, 0, this, 0);
+            retiringRemuxSession->cancel();
+            retiringRemuxSession->deleteLater();
+        }
+        retiringRemuxSession = remuxSession; // stays connected: its merged files keep the old quality playing
+        remuxSession = 0;
+    } else {
+        // Initial playback / new video, or the old file is already complete.
+        bool keepPlayingState = (pendingRemuxQualityLabel != "");
+        bool wasPartial = playingPartialRemux;
+        double playable = remuxPlayableSeconds;
+        clearRemuxSessions();
+        if (keepPlayingState) {
+            playingPartialRemux = wasPartial;
+            remuxPlayableSeconds = playable;
+        }
+    }
 
-    remuxSession = new StreamingRemuxSession(ApplicationUI::networkManager, videoData.url,
-            storageData.audio.url, outputPath, this);
+    remuxSession = new ChunkedRemuxSession(ApplicationUI::networkManager, videoData.url,
+            storageData.audio.url, cacheDir, base, this, 5.0);
 
-    QObject::connect(remuxSession, SIGNAL(headReady()), this, SLOT(onRemuxHeadReady()));
+    QObject::connect(remuxSession, SIGNAL(progress(double, double)), this,
+            SLOT(onRemuxProgress(double, double)));
+    QObject::connect(remuxSession, SIGNAL(mergedReady(QString, double, bool)), this,
+            SLOT(onRemuxMerged(QString, double, bool)));
     QObject::connect(remuxSession, SIGNAL(failed(QString)), this, SLOT(onRemuxFailed(QString)));
-    QObject::connect(remuxSession, SIGNAL(finished()), this, SLOT(onRemuxFinished()));
 
     remuxSession->start();
 }
 
-void PlayerPage::onRemuxHeadReady()
+// Decides whether it is time to ask the session for a newer merged file.
+//
+// A merged file is only ever swapped in when needed -- every swap reloads the
+// source, which costs a short hiccup -- i.e. when the player is about to run
+// out of the data it has (or has already stopped because it did). The very
+// first file is requested as soon as the first chunk is downloaded.
+void PlayerPage::maybeRequestRemuxMerge()
 {
-    // Output file is now valid ISOBMFF at its final size (moov/stco/stsz
-    // etc. written, mdat regions still blank/sparse). NOT safe to hand to
-    // the player yet: headReady() fires before beginBodyDownloads()/
-    // beginFragmentedBodyDownloads() has even been called, so at this
-    // point zero bytes of audio or video body have actually been written.
-    // Playback is kicked off later, from onRemuxFinished()/
-    // onPreviewRemuxFinished(), once the WHOLE file (preview or full) is
-    // on disk -- see onRemuxFinished() for why.
-}
+    double posSec = playerContext->getPosition() / 1000.0;
 
-void PlayerPage::onPreviewRemuxFinished()
-{
-    if (!previewRemuxSession) return;
+    // Old quality still playing while the new one catches up: keep feeding it.
+    if (retiringRemuxSession && playingPartialRemux && !retiringRemuxSession->isMerging()
+            && retiringRemuxSession->downloadedSeconds() > remuxPlayableSeconds + 0.5
+            && remuxPlayableSeconds - posSec < REMUX_SWAP_LEAD_SECONDS) {
+        retiringRemuxSession->requestMerge();
+    }
 
-    // Full remux may have already finished and started playback on its
-    // own (fast connection, short video) by the time this fires -- if
-    // so, the preview is moot, just clean it up.
-    if (remuxPlaybackStarted) {
-        previewRemuxSession->deleteLater();
-        previewRemuxSession = 0;
+    if (!remuxSession || remuxSession->isMerging()) return;
+    double downloaded = remuxSession->downloadedSeconds();
+    if (downloaded <= 0) return;
+
+    if (pendingRemuxQualityLabel != "") {
+        // Quality switch: wait until the new file reaches well past the
+        // current position, or is complete.
+        if (remuxSession->isDownloadComplete()
+                || downloaded >= posSec + REMUX_QUALITY_SWITCH_AHEAD_SECONDS + 2.0) {
+            remuxSession->requestMerge();
+        }
         return;
     }
-
-    QString path = previewRemuxSession->outputPath();
-    previewRemuxSession->deleteLater();
-    previewRemuxSession = 0;
-
-    startPlaybackAt(path);
-    remuxPlaybackStarted = true;
-    playingFromPreview = true;
-
-#ifdef QT_DEBUG
-    qDebug() << "[bbtube][remux] preview finished writing, playing from" << path
-             << "while full remux continues";
-#endif
-}
-
-void PlayerPage::onPreviewRemuxFailed(QString errorMessage)
-{
-    // Not fatal -- the full remux is still running and will play once
-    // it's done, same as if there had never been a preview. No toast:
-    // surfacing an error here for something the person didn't ask for
-    // and whose failure is invisible to them (playback just starts a
-    // little later than it could have) would be confusing.
-    qDebug() << "[bbtube][remux] preview failed (non-fatal, waiting for full remux):" << errorMessage;
-    if (previewRemuxSession) {
-        previewRemuxSession->deleteLater();
-        previewRemuxSession = 0;
+    if (!remuxPlaybackStarted) {
+        remuxSession->requestMerge();
+        return;
+    }
+    if (!playingPartialRemux) return; // already playing the complete file
+    if (downloaded > remuxPlayableSeconds + 0.5
+            && remuxPlayableSeconds - posSec < REMUX_SWAP_LEAD_SECONDS) {
+        remuxSession->requestMerge();
     }
 }
 
-void PlayerPage::onRemuxFinished()
+void PlayerPage::onRemuxProgress(double downloadedSeconds, double totalSeconds)
 {
-    // Both tracks fully written to the local output file -- and, per
-    // StreamingRemuxSession::checkAllDone(), the output file handle has
-    // already been close()'d, which guarantees everything is actually on
-    // disk (not just handed to a QFile write buffer). Only NOW is it
-    // safe to open this path in the player.
-    //
-    // This used to be wired to audioComplete() instead, on the theory
-    // that mmrenderer reads a local file sequentially from the front, so
-    // playback could start once audio (which sits before video in the
-    // output layout -- see StreamingRemuxSession's audioOutputOffset <
-    // videoOutputOffset) was fully on disk, even while the much larger
-    // video body was still streaming in behind it. That theory doesn't
-    // hold in practice: mmrenderer's attachInput() appears to need the
-    // whole file (or at least enough of the tail/moov-adjacent structure
-    // that a partially-written video mdat still counts as "not ready")
-    // before it will open a local file at all. Confirmed in the field --
-    // attachInput failed immediately after play(), every time, with the
-    // video body only 60-80% downloaded at that point despite audio
-    // having completed seconds earlier. (This is also why there's no
-    // attempt to attach mmrenderer directly to the FULL output file
-    // while it's still being written -- see previewRemuxSession instead,
-    // which sidesteps this by remuxing a short, separately-finished file.)
+    Q_UNUSED(downloadedSeconds);
+    Q_UNUSED(totalSeconds);
+    maybeRequestRemuxMerge();
+}
+
+void PlayerPage::onRemuxMerged(QString path, double coveredSeconds, bool isFinal)
+{
+    ChunkedRemuxSession *src = qobject_cast<ChunkedRemuxSession *>(QObject::sender());
+    // coveredSeconds is 0 for a cache hit (complete file, length not parsed).
+    double covered = (isFinal || coveredSeconds <= 0) ? 1e9 : coveredSeconds;
+    double posSec = playerContext->getPosition() / 1000.0;
+
+    if (src && src == retiringRemuxSession) {
+        // A longer file of the quality that is still playing.
+        bool stalled = playerContext->getMediaState() == bb::multimedia::MediaState::Stopped
+                && posSec >= remuxPlayableSeconds - 2.5;
+        changeQuality(quality, path, stalled);
+        playingPartialRemux = !isFinal;
+        remuxPlayableSeconds = covered;
+        remuxStallToastShown = false;
+        maybeRequestRemuxMerge();
+        return;
+    }
     if (!remuxSession) return;
 
     if (pendingRemuxQualityLabel != "") {
+        if (!isFinal && covered < posSec + 4.0) {
+            // The player outran this file while it was being merged; wait for a longer one.
+            maybeRequestRemuxMerge();
+            return;
+        }
         QString newQuality = pendingRemuxQualityLabel;
         pendingRemuxQualityLabel = "";
-        changeQuality(newQuality, remuxSession->outputPath());
-    } else if (playingFromPreview) {
-        // Already playing the preview -- swap the same player instance
-        // over to the full file and resume at the same position, same
-        // mechanism as an ordinary quality change (GlobalPlayerContext::
-        // changeQuality() reads position/state before swapping the
-        // source and restores them after).
-        changeQuality(quality, remuxSession->outputPath());
-        playingFromPreview = false;
-    } else {
-        // Preview never got a chance to play from (failed, or lost the
-        // race to the full remux) -- behave exactly as before.
-        startPlaybackAt(remuxSession->outputPath());
+        changeQuality(newQuality, path);
         remuxPlaybackStarted = true;
-    }
+        playingPartialRemux = !isFinal;
+        remuxPlayableSeconds = covered;
+        remuxStallToastShown = false;
+        if (retiringRemuxSession) {
+            QObject::disconnect(retiringRemuxSession, 0, this, 0);
+            retiringRemuxSession->cancel();
+            retiringRemuxSession->deleteLater();
+            retiringRemuxSession = 0;
+        }
+    } else if (!remuxPlaybackStarted) {
+        startPlaybackAt(path); // resets playingPartialRemux
+        remuxPlaybackStarted = true;
+        playingPartialRemux = !isFinal;
+        remuxPlayableSeconds = covered;
+        remuxStallToastShown = false;
+    } else {
+        // Swap the already-playing player over to the longer file
+        // (position-preserving). If the player had already run dry on the
+        // previous file it sits in Stopped near that file's end: restart it.
+        bool stalled = playerContext->getMediaState() == bb::multimedia::MediaState::Stopped
+                && posSec >= remuxPlayableSeconds - 2.5;
+        changeQuality(quality, path, stalled);
+        playingPartialRemux = !isFinal;
+        remuxPlayableSeconds = covered;
+        remuxStallToastShown = false;
 
-#ifdef QT_DEBUG
-    qDebug() << "[bbtube][remux] finished writing" << remuxSession->outputPath();
-#endif
+        if (remuxSeekTargetMs > 0 && (remuxSeekTargetMs / 1000.0) + 1.0 < covered) {
+            playerContext->seekTime(remuxSeekTargetMs);
+            remuxSeekTargetMs = 0;
+        }
+    }
+    qDebug() << "[bbtube][chunk] player now has" << path << "covering" << covered << "s final:" << isFinal;
+
+    // The player may already be close to the end of this file (slow link).
+    maybeRequestRemuxMerge();
 }
 
 void PlayerPage::onRemuxFailed(QString errorMessage)
 {
-    qDebug() << "[bbtube][remux] failed:" << errorMessage;
-    if (!playingFromPreview) {
-        // If the preview is already playing, the person has something
-        // watchable on screen right now -- the full remux failing just
-        // means playback won't extend past the preview's ~15s, which
-        // isn't worth interrupting them with an error toast for. If
-        // nothing has played yet, this is the same failure as before.
+    qDebug() << "[bbtube][chunk] failed:" << errorMessage;
+    if (retiringRemuxSession && QObject::sender() == retiringRemuxSession) {
+        return; // old quality stops growing; whatever it already merged keeps playing
+    }
+    if (!remuxPlaybackStarted) {
+        // Nothing has played yet -- there is nothing to fall back on.
         UIUtils::toastError("Source unavailable");
+    } else {
+        // Something is already playing; keep whatever was downloaded so far
+        // watchable. Make one last merge of everything that arrived.
+        UIUtils::toastError("Download interrupted");
+        if (remuxSession) {
+            remuxSession->requestMerge();
+        }
     }
-    if (remuxSession) {
-        remuxSession->deleteLater();
-        remuxSession = 0;
-    }
-    // A still-running preview is moot without a full remux to hand off
-    // to -- tear it down too, but only if it hasn't already played (if
-    // playingFromPreview is true, previewRemuxSession is already 0 --
-    // see onPreviewRemuxFinished()). Leaves the person stuck at the
-    // preview's ~15s with nowhere further to go, same as any other
-    // failed load past that point.
-    if (previewRemuxSession) {
-        previewRemuxSession->cancel();
-        previewRemuxSession->deleteLater();
-        previewRemuxSession = 0;
-    }
-    remuxPlaybackStarted = playingFromPreview; // preserve "something is already playing" if that's the case
     pendingRemuxQualityLabel = "";
+    if (retiringRemuxSession) {
+        retiringRemuxSession->cancel();
+        retiringRemuxSession->deleteLater();
+        retiringRemuxSession = 0;
+    }
 }
 
+// Seeking to something that has not been downloaded yet would just park the
+// player at the end of its file; remember the wish, play up to the end of
+// what exists, and jump there as soon as a longer file is swapped in.
+void PlayerPage::seekWithinPlayable(unsigned int positionMs)
+{
+    if (playingPartialRemux && positionMs / 1000.0 > remuxPlayableSeconds - 1.5) {
+        remuxSeekTargetMs = positionMs;
+        double safe = remuxPlayableSeconds - 2.0;
+        positionMs = safe > 0 ? (unsigned int) (safe * 1000) : 0;
+        if (!remuxStallToastShown) {
+            remuxStallToastShown = true;
+            UIUtils::toastInfo("Not downloaded yet...");
+        }
+    } else {
+        remuxSeekTargetMs = 0;
+    }
+    playerContext->seekTime(positionMs);
+}
 
-QString PlayerPage::remuxOutputPathFor(QString videoId, QString quality)
+QString PlayerPage::remuxCacheDir()
 {
     QDir dir(QDir::homePath() + "/remux_cache");
     if (!dir.exists()) {
         dir.mkpath(".");
     }
+    return dir.absolutePath();
+}
+
+QString PlayerPage::remuxBaseNameFor(QString videoId, QString quality)
+{
     QString safeQuality = quality;
     safeQuality.replace(QRegExp("[^A-Za-z0-9]"), "_");
-    return dir.absoluteFilePath(videoId + "_" + safeQuality + ".mp4");
+    // "_c" (chunked): files written by older builds under the plain
+    // <id>_<quality>.mp4 name were pre-allocated and may be incomplete.
+    return videoId + "_" + safeQuality + "_c";
 }
 
 void PlayerPage::setInfos()
@@ -1078,6 +1156,10 @@ void PlayerPage::onPlayerPositionChanged(unsigned int position)
     if (!manualSeeking && !trackpadFocusInSlider) {
         progressSlider->setValue(position);
     }
+
+    if (playingPartialRemux || pendingRemuxQualityLabel != "") {
+        maybeRequestRemuxMerge();
+    }
 }
 
 void PlayerPage::onProgressSliderValueChanged(float position)
@@ -1087,10 +1169,10 @@ void PlayerPage::onProgressSliderValueChanged(float position)
     }
 
     if (sliderDoubleTap) {
-        playerContext->seekTime((int) position);
+        seekWithinPlayable((unsigned int) position);
         sliderDoubleTap = false;
     } else if (manualSeeking && !trackpadFocusInSlider) {
-        playerContext->seekTime((int) position);
+        seekWithinPlayable((unsigned int) position);
         manualSeeking = false;
     } else if (!trackpadFocusInSlider) {
         manualSeeking = false;
@@ -1766,7 +1848,7 @@ void PlayerPage::onDoubleTappedHandler(bb::cascades::DoubleTapEvent* e)
     }
 }
 
-void PlayerPage::changeQuality(QString newQuality, QString url)
+void PlayerPage::changeQuality(QString newQuality, QString url, bool forcePlay)
 {
     quality = newQuality;
     qualityActionItem->setTitle(quality);
@@ -1787,7 +1869,7 @@ void PlayerPage::changeQuality(QString newQuality, QString url)
         playerContext->resizeFullScreenVideo();
     }
 
-    bb::multimedia::MediaError::Type error = playerContext->changeQuality(url);
+    bb::multimedia::MediaError::Type error = playerContext->changeQuality(url, forcePlay);
     if (error != bb::multimedia::MediaError::None) {
         UIUtils::toastError("Source unavailable");
     }

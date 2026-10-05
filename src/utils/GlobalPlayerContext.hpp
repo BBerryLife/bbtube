@@ -88,7 +88,7 @@ public:
     int getDuration();
     bb::multimedia::MediaError::Type play();
     bb::multimedia::MediaError::Type play(QString url);
-    bb::multimedia::MediaError::Type changeQuality(QString url);
+    bb::multimedia::MediaError::Type changeQuality(QString url, bool forcePlay = false);
     bb::multimedia::MediaError::Type setEqualizerPreset(
             bb::multimedia::EqualizerPreset::Type preset);
     void setMetadata(VideoMetadata videoMetadata, StorageData storageData, bool audioOnly);

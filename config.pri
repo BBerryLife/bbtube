@@ -145,6 +145,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/BasePage.cpp) \
         $$quote($$BASEDIR/src/utils/BaseSheet.cpp) \
         $$quote($$BASEDIR/src/utils/ChannelListProxy.cpp) \
+        $$quote($$BASEDIR/src/utils/ChunkedRemuxSession.cpp) \
         $$quote($$BASEDIR/src/utils/FileLogger.cpp) \
         $$quote($$BASEDIR/src/utils/GlobalPlayerContext.cpp) \
         $$quote($$BASEDIR/src/utils/MiniPlayer.cpp) \
@@ -226,6 +227,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/BaseTab.hpp) \
         $$quote($$BASEDIR/src/utils/CCUtils.hpp) \
         $$quote($$BASEDIR/src/utils/ChannelListProxy.hpp) \
+        $$quote($$BASEDIR/src/utils/ChunkedRemuxSession.hpp) \
         $$quote($$BASEDIR/src/utils/CustomListView.hpp) \
         $$quote($$BASEDIR/src/utils/DateTimeUtils.hpp) \
         $$quote($$BASEDIR/src/utils/FileLogger.hpp) \

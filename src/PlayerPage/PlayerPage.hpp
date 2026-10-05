@@ -11,7 +11,7 @@
 #include "src/models/PlaylistVideoModel.hpp"
 #include "src/models/PlaylistListItemModel.hpp"
 #include "src/utils/CustomListView.hpp"
-#include "src/utils/StreamingRemuxSession.hpp"
+#include "src/utils/ChunkedRemuxSession.hpp"
 
 #include <bb/cascades/Container>
 #include <bb/cascades/Slider>
@@ -88,11 +88,9 @@ private slots:
     void onPlaylistVideoAdded(PlaylistVideoModel* video);
     void onPlaylistVideoDeleted(QString videoId, PlaylistListItemModel::Type playlistType);
     void onPlaylistVideoDeletedAll(PlaylistListItemModel::Type playlistType);
-    void onRemuxHeadReady();
+    void onRemuxProgress(double downloadedSeconds, double totalSeconds);
+    void onRemuxMerged(QString path, double coveredSeconds, bool isFinal);
     void onRemuxFailed(QString errorMessage);
-    void onRemuxFinished();
-    void onPreviewRemuxFailed(QString errorMessage);
-    void onPreviewRemuxFinished();
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -140,28 +138,25 @@ private:
     QString quality;
     QString nextVideoId;
     QString prevVideoId;
-    StreamingRemuxSession *remuxSession;
-    // Short (~15s) standalone preview remux, started alongside remuxSession
-    // on an INITIAL playback only (not a mid-playback quality change --
-    // see playVideoWithRemux() vs changeQualityWithRemux()) so something
-    // is watchable fast instead of waiting for the whole video to remux.
-    // 0 once its job is done (played from, or made moot by remuxSession
-    // finishing first) or on any teardown path (see clearRemuxSessions()).
-    StreamingRemuxSession *previewRemuxSession;
-    // True once ANY playback (from the preview file or the full file)
-    // has started for the current playVideoWithRemux() call -- lets
-    // onPreviewRemuxFinished() detect "the full remux already finished
-    // and started playback first" (fast connection/short video) and
-    // skip starting a second, redundant playback from the now-pointless
-    // preview file.
+    // Downloads the adaptive video+audio pair in ~5s chunks and keeps
+    // producing complete merged MP4s covering more and more of the video
+    // (see ChunkedRemuxSession). 0 when the current video isn't remuxed.
+    ChunkedRemuxSession *remuxSession;
+    // Session of the quality we were playing before a mid-playback quality
+    // change, kept running (and kept feeding the file the player is still
+    // reading) until the new quality's first file takes over.
+    ChunkedRemuxSession *retiringRemuxSession;
+    // A merged file of the current remuxSession has been handed to the player.
     bool remuxPlaybackStarted;
-    // True once playback specifically started FROM the preview file
-    // (implies remuxPlaybackStarted) -- tells onRemuxFinished()
-    // (remuxSession's, the full one) to swap the already-playing player
-    // over to the full file via playerContext->changeQuality()
-    // (position-preserving) instead of starting fresh playback via
-    // startPlaybackAt().
-    bool playingFromPreview;
+    // Seconds of the video covered by the file the player currently has
+    // loaded (only meaningful while playingPartialRemux).
+    double remuxPlayableSeconds;
+    // The loaded file is a partial merge (the player will run out of data
+    // at remuxPlayableSeconds unless it is swapped for a longer one).
+    bool playingPartialRemux;
+    // Position the person seeked to that is not downloaded yet (ms), 0 if none.
+    unsigned int remuxSeekTargetMs;
+    bool remuxStallToastShown;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
     void playVideo();
@@ -170,13 +165,16 @@ private:
     void hideInfos();
     void showInfos();
     void setAudioOnly(bool audioOnly);
-    void changeQuality(QString newQuality, QString url);
+    void changeQuality(QString newQuality, QString url, bool forcePlay = false);
     void startPlaybackAt(QString url);
     void playVideoWithRemux(SingleVideoStorageData videoData);
     void changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData);
     void startRemuxSession(SingleVideoStorageData videoData);
-    void clearRemuxSessions(); // cancels+deletes remuxSession and previewRemuxSession, if present; resets playingFromPreview
-    QString remuxOutputPathFor(QString videoId, QString quality);
+    void clearRemuxSessions(); // cancels+deletes remuxSession and retiringRemuxSession, if present
+    void maybeRequestRemuxMerge();
+    void seekWithinPlayable(unsigned int positionMs);
+    QString remuxCacheDir();
+    QString remuxBaseNameFor(QString videoId, QString quality);
     int getIndexOfDefaultQuality();
     QString getScalingMethodString(bb::cascades::ScalingMethod::Type type);
     void adjustInfoScreen();

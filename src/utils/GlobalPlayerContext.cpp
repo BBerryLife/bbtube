@@ -217,7 +217,7 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 
     return error;
 }
-bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url)
+bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url, bool forcePlay)
 {
     int currPosition = mediaPlayer->position();
     bb::multimedia::MediaState::Type currState = mediaPlayer->mediaState();
@@ -232,7 +232,9 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url)
     if (!audioOnly) {
         mediaPlayer->seekTime(currPosition);
     }
-    if (currState == bb::multimedia::MediaState::Started) {
+    // forcePlay: resume even though the old (partial) file had already run
+    // out of data and the player sat in Stopped.
+    if (currState == bb::multimedia::MediaState::Started || forcePlay) {
         bb::multimedia::MediaError::Type error = mediaPlayer->play();
 
         return error;

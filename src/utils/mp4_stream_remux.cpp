@@ -146,6 +146,7 @@ SidxInfo parseSidx(const Mp4RemuxBytes &headBytes, size_t searchStart, size_t en
     uint8_t version = p[0];
     size_t off = 4; // skip version+flags
     off += 4;        // reference_ID
+    info.timescale = rd32(p + off);
     off += 4;        // timescale
     uint64_t firstOffset;
     if (version == 0) {
@@ -259,6 +260,7 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
 
     BoxLoc trun = findBoxOrThrow(moofBytes, trafStart, trafEnd, label, "trun");
     const uint8_t *rp = &moofBytes[trun.payloadOffset];
+    uint8_t trunVersion = rp[0];
     uint32_t trunFlags = rd32(rp) & 0x00FFFFFFu;
     size_t rOff = 4;
     uint32_t sampleCount = rd32(rp + rOff);
@@ -310,12 +312,21 @@ std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
             // other sample in the trun defaults to non-sync).
             sampleIsSync = firstSampleIsSync;
         }
-        if (trunFlags & 0x000800) { rOff += 4; } // sample_composition_time_offset
+        int32_t sampleCompositionOffset = 0;
+        if (trunFlags & 0x000800) {
+            // Unsigned in trun v0, signed in v1 -- the same 32 bits, so
+            // reinterpreting as int32_t is right for both as long as v0
+            // offsets stay below 2^31 (they always do in practice).
+            sampleCompositionOffset = int32_t(rd32(rp + rOff));
+            (void)trunVersion;
+            rOff += 4;
+        }
 
         s.offsetInSource = sampleCursor;
         s.size = sampleSize;
         s.duration = sampleDuration;
         s.isSync = sampleIsSync;
+        s.compositionOffset = sampleCompositionOffset;
         out.push_back(s);
 
         sampleCursor += sampleSize;
@@ -390,6 +401,61 @@ void buildProgressiveTablesFromFragments(TrackHead &track) {
         }
     }
     track.stcoBox = makeBox(track.stcoIs64 ? "co64" : "stco", stco);
+
+    // ctts: composition (PTS - DTS) offsets, run-length encoded. Only
+    // emitted when at least one sample has a non-zero offset (i.e. the
+    // stream really uses B-frame reordering). Version 1 (signed offsets)
+    // only if some offset is negative.
+    track.cttsBox.clear();
+    {
+        bool anyOffset = false, anyNegative = false;
+        for (size_t i = 0; i < samples.size(); i++) {
+            if (samples[i].compositionOffset != 0) anyOffset = true;
+            if (samples[i].compositionOffset < 0) anyNegative = true;
+        }
+        if (anyOffset) {
+            Mp4RemuxBytes ctts;
+            wr32(ctts, anyNegative ? 0x01000000u : 0u); // version + flags
+            size_t cntPos = ctts.size();
+            wr32(ctts, 0);
+            uint32_t cnt = 0;
+            size_t i = 0;
+            while (i < samples.size()) {
+                int32_t off = samples[i].compositionOffset;
+                size_t runStart = i;
+                while (i < samples.size() && samples[i].compositionOffset == off) i++;
+                wr32(ctts, uint32_t(i - runStart));
+                wr32(ctts, uint32_t(off));
+                cnt++;
+            }
+            ctts[cntPos+0]=uint8_t(cnt>>24); ctts[cntPos+1]=uint8_t(cnt>>16);
+            ctts[cntPos+2]=uint8_t(cnt>>8);  ctts[cntPos+3]=uint8_t(cnt);
+            track.cttsBox = makeBox("ctts", ctts);
+        }
+    }
+
+    // stss: sync-sample (keyframe) table, video only, and only when some
+    // samples are NOT sync (absent stss == "every sample is a sync
+    // sample", which is wrong for inter-coded video and breaks seeking).
+    track.stssBox.clear();
+    if (track.isVideo) {
+        bool anyNonSync = false;
+        for (size_t i = 0; i < samples.size(); i++)
+            if (!samples[i].isSync) { anyNonSync = true; break; }
+        if (anyNonSync) {
+            Mp4RemuxBytes stss;
+            wr32(stss, 0);
+            size_t cntPos = stss.size();
+            wr32(stss, 0);
+            uint32_t cnt = 0;
+            for (size_t i = 0; i < samples.size(); i++) {
+                if (samples[i].isSync) { wr32(stss, uint32_t(i + 1)); cnt++; }
+            }
+            stss[cntPos+0]=uint8_t(cnt>>24); stss[cntPos+1]=uint8_t(cnt>>16);
+            stss[cntPos+2]=uint8_t(cnt>>8);  stss[cntPos+3]=uint8_t(cnt);
+            track.stssBox = makeBox("stss", stss);
+        }
+    }
 
     // The "mdat" for a fragmented source isn't contiguous in the original
     // resource, but mdatDeclaredSize is used elsewhere only to size the
@@ -1004,4 +1070,175 @@ bool writeBodyChunk(const std::string &outputPath, uint64_t outputOffset,
         if (errorOut) *errorOut = e.what();
         return false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Partial remux / chunk planning (progressive playback)
+// ---------------------------------------------------------------------------
+static void patchBE(Mp4RemuxBytes &box, size_t off, uint64_t v, int bytes) {
+    for (int i = 0; i < bytes; i++)
+        box[off + size_t(i)] = uint8_t(v >> (8 * (bytes - 1 - i)));
+}
+// `mdhd` / `tkhd` are whole boxes (8-byte header included). mdhd's duration
+// is in the media timescale, tkhd's in the movie timescale (1000 here, see
+// buildFtypMoov()).
+static void patchMdhdDuration(Mp4RemuxBytes &mdhd, uint64_t dur) {
+    if (mdhd.size() < 32) return;
+    if (mdhd[8] == 1) { if (mdhd.size() >= 40) patchBE(mdhd, 32, dur, 8); }
+    else patchBE(mdhd, 24, dur, 4);
+}
+static void patchTkhdDuration(Mp4RemuxBytes &tkhd, uint64_t dur) {
+    if (tkhd.size() < 32) return;
+    if (tkhd[8] == 1) { if (tkhd.size() >= 44) patchBE(tkhd, 36, dur, 8); }
+    else patchBE(tkhd, 28, dur, 4);
+}
+
+bool planPartialRemux(const TrackHead &videoSrc, const TrackHead &audioSrc,
+                       size_t videoSampleCount, size_t audioSampleCount,
+                       RemuxPlan *outPlan, std::string *errorOut) {
+    try {
+        if (!videoSrc.isVideo) throw std::runtime_error("videoSrc is not a video track");
+        if (audioSrc.isVideo)  throw std::runtime_error("audioSrc is not an audio track");
+        if (videoSampleCount == 0 || audioSampleCount == 0)
+            throw std::runtime_error("planPartialRemux needs at least one sample per track");
+
+        TrackHead v = sliceTrackHeadForSegment(videoSrc, 0, videoSampleCount);
+        TrackHead a = sliceTrackHeadForSegment(audioSrc, 0, audioSampleCount);
+
+        uint64_t vDur = 0, aDur = 0;
+        for (size_t i = 0; i < v.fragSamples.size(); i++) vDur += v.fragSamples[i].duration;
+        for (size_t i = 0; i < a.fragSamples.size(); i++) aDur += a.fragSamples[i].duration;
+        v.duration = vDur;
+        a.duration = aDur;
+        if (v.timescale == 0 || a.timescale == 0) throw std::runtime_error("zero timescale");
+        patchMdhdDuration(v.mdhdBox, vDur);
+        patchMdhdDuration(a.mdhdBox, aDur);
+        patchTkhdDuration(v.tkhdBox, uint64_t(double(vDur) / v.timescale * 1000.0));
+        patchTkhdDuration(a.tkhdBox, uint64_t(double(aDur) / a.timescale * 1000.0));
+
+        uint64_t bodyBytes = v.mdatDeclaredSize + a.mdatDeclaredSize;
+        size_t mdatHeaderSize = (bodyBytes + 8 > 0xFFFFFFFFull) ? 16 : 8;
+
+        Mp4RemuxBytes head = buildFtypMoov(v, a);
+        size_t outMdatStart = head.size() + mdatHeaderSize;
+        size_t audioOutStart = outMdatStart;
+        size_t videoOutStart = outMdatStart + size_t(a.mdatDeclaredSize);
+        rebuildStcoContiguous(a, uint64_t(audioOutStart));
+        rebuildStcoContiguous(v, uint64_t(videoOutStart));
+
+        Mp4RemuxBytes finalHead = buildFtypMoov(v, a);
+        if (finalHead.size() != head.size())
+            throw std::runtime_error("internal error: moov size changed between passes");
+
+        Mp4RemuxBytes mdatHeader;
+        if (mdatHeaderSize == 8) {
+            wr32(mdatHeader, uint32_t(8 + bodyBytes));
+            mdatHeader.push_back('m'); mdatHeader.push_back('d');
+            mdatHeader.push_back('a'); mdatHeader.push_back('t');
+        } else {
+            wr32(mdatHeader, 1);
+            mdatHeader.push_back('m'); mdatHeader.push_back('d');
+            mdatHeader.push_back('a'); mdatHeader.push_back('t');
+            uint64_t total = 16 + bodyBytes;
+            wr32(mdatHeader, uint32_t(total >> 32));
+            wr32(mdatHeader, uint32_t(total));
+        }
+
+        outPlan->headBytes = finalHead;
+        outPlan->headBytes.insert(outPlan->headBytes.end(), mdatHeader.begin(), mdatHeader.end());
+        outPlan->audioOutputOffset = audioOutStart;
+        outPlan->audioBodySize = a.mdatDeclaredSize;
+        outPlan->videoOutputOffset = videoOutStart;
+        outPlan->videoBodySize = v.mdatDeclaredSize;
+        outPlan->totalOutputSize = outMdatStart + a.mdatDeclaredSize + v.mdatDeclaredSize;
+        return true;
+    } catch (const std::exception &e) {
+        if (errorOut) *errorOut = e.what();
+        return false;
+    }
+}
+
+std::vector<double> sidxFragmentStartSeconds(const SidxInfo &sidx) {
+    std::vector<double> out;
+    if (!sidx.found || sidx.timescale == 0) return out;
+    double t = 0.0;
+    out.push_back(0.0);
+    for (size_t i = 0; i < sidx.entries.size(); i++) {
+        t += double(sidx.entries[i].subsegmentDuration) / double(sidx.timescale);
+        out.push_back(t);
+    }
+    return out;
+}
+
+std::vector<ChunkPlanEntry> planChunksFromSidx(const SidxInfo &videoSidx, double targetSeconds) {
+    std::vector<ChunkPlanEntry> chunks;
+    std::vector<double> starts = sidxFragmentStartSeconds(videoSidx);
+    if (starts.size() < 2) return chunks;
+    size_t n = starts.size() - 1;
+    size_t i = 0;
+    while (i < n) {
+        size_t j = i + 1;
+        while (j < n && starts[j] - starts[i] < targetSeconds - 1e-6) j++;
+        ChunkPlanEntry c;
+        c.fragStart = i;
+        c.fragEnd = j;
+        c.startSec = starts[i];
+        c.endSec = starts[j];
+        chunks.push_back(c);
+        i = j;
+    }
+    return chunks;
+}
+
+bool verifyAvcSamples(const TrackHead &track, const std::vector<FragSample> &samples,
+                       size_t firstIdx, size_t count, const uint8_t *data, size_t dataLen) {
+    if (!track.isVideo) return true;
+    const Mp4RemuxBytes &b = track.stsdBox;
+    size_t lenSize = 0;
+    for (size_t i = 0; i + 9 <= b.size(); i++) {
+        if (b[i] == 'a' && b[i+1] == 'v' && b[i+2] == 'c' && b[i+3] == 'C') {
+            lenSize = size_t(b[i + 8] & 3) + 1;
+            break;
+        }
+    }
+    if (lenSize == 0) return true; // not AVC (or unknown) -- check does not apply
+
+    size_t base = 0;
+    for (size_t k = 0; k < count; k++) {
+        size_t sz = samples[firstIdx + k].size;
+        if (base + sz > dataLen) return false;
+        const uint8_t *s = data + base;
+        size_t p = 0;
+        while (p < sz) {
+            if (p + lenSize > sz) return false;
+            size_t nal = 0;
+            for (size_t q = 0; q < lenSize; q++) nal = (nal << 8) | s[p + q];
+            p += lenSize;
+            if (nal == 0 || p + nal > sz) return false;
+            if (s[p] & 0x80) return false; // forbidden_zero_bit
+            p += nal;
+        }
+        base += sz;
+    }
+    return true;
+}
+
+bool verifyAacSamples(const TrackHead &track, const std::vector<FragSample> &samples,
+                       size_t firstIdx, size_t count, const uint8_t *data, size_t dataLen) {
+    if (track.isVideo) return true;
+    const Mp4RemuxBytes &b = track.stsdBox;
+    bool isAac = false;
+    for (size_t i = 0; i + 4 <= b.size(); i++) {
+        if (b[i] == 'm' && b[i+1] == 'p' && b[i+2] == '4' && b[i+3] == 'a') { isAac = true; break; }
+    }
+    if (!isAac) return true;
+
+    size_t base = 0;
+    for (size_t k = 0; k < count; k++) {
+        size_t sz = samples[firstIdx + k].size;
+        if (base + sz > dataLen) return false;
+        if (sz > 2 && (data[base] >> 5) == 7) return false;
+        base += sz;
+    }
+    return true;
 }
