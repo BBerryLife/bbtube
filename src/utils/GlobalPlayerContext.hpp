@@ -24,6 +24,9 @@ class GlobalPlayerContext: public QObject
     void npcNext();
     void npcPrev();
     void positionChanged(unsigned int);
+    // seekTime() was called while the loaded file is only a window onto the
+    // video (see setTimeline); the owner decides how to satisfy it.
+    void seekRequested(unsigned int);
     void mediaStateChanged(bb::multimedia::MediaState::Type);
     void orientationChanged();
     void metadataChanged();
@@ -57,6 +60,12 @@ private:
     // The loaded file is a partial, still-growing remux: its end is NOT the
     // end of the video (see PlayerPage / ChunkedRemuxSession).
     bool partialSource;
+    // The loaded file is a remuxed window of the video: its own 0:00 is
+    // positionOffsetMs into the video, and the video is fullDurationMs long
+    // (0: trust the player). Everything outside this class works in VIDEO time.
+    int positionOffsetMs;
+    int fullDurationMs;
+    bool seekIntercept;
     VideoMetadata videoMetadata;
     StorageData storageData;
     SingleVideoStorageData selectedStorageData;
@@ -94,6 +103,9 @@ public:
     bb::multimedia::MediaError::Type changeQuality(QString url, bool forcePlay = false,
             int seekMs = -1);
     void setPartialSource(bool partial);
+    void setTimeline(int offsetMs, int fullDurationMs);
+    void setSeekIntercept(bool intercept);
+    void seekTimeDirect(unsigned int);
     bb::multimedia::MediaError::Type setEqualizerPreset(
             bb::multimedia::EqualizerPreset::Type preset);
     void setMetadata(VideoMetadata videoMetadata, StorageData storageData, bool audioOnly);

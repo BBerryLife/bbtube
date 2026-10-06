@@ -13,6 +13,9 @@
 #include "src/utils/CustomListView.hpp"
 #include "src/utils/ChunkedRemuxSession.hpp"
 #include <QPointer>
+#include <QTimer>
+#include <bb/cascades/ActivityIndicator>
+#include <bb/cascades/Container>
 #include <QTime>
 
 #include <bb/cascades/Container>
@@ -90,9 +93,11 @@ private slots:
     void onPlaylistVideoAdded(PlaylistVideoModel* video);
     void onPlaylistVideoDeleted(QString videoId, PlaylistListItemModel::Type playlistType);
     void onPlaylistVideoDeletedAll(PlaylistListItemModel::Type playlistType);
-    void onRemuxProgress(double downloadedSeconds, double totalSeconds);
-    void onRemuxMerged(QString path, double coveredSeconds, bool isFinal);
+    void onRemuxProgress(int chunkIndex);
+    void onRemuxMerged(QString path, int startChunk, int chunkCount, bool isFinal);
     void onRemuxFailed(QString errorMessage);
+    void onSeekRequested(unsigned int positionMs);
+    void onRemuxWatchdog();
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -140,8 +145,8 @@ private:
     QString quality;
     QString nextVideoId;
     QString prevVideoId;
-    // Downloads the adaptive video+audio pair in ~5s chunks and keeps
-    // producing complete merged MP4s covering more and more of the video
+    // Downloads the adaptive video+audio pair in ~5s chunks, keeps them, and
+    // produces complete merged MP4 files covering runs of consecutive chunks
     // (see ChunkedRemuxSession). 0 when the current video isn't remuxed.
     ChunkedRemuxSession *remuxSession;
     // Session of the quality we were playing before a mid-playback quality
@@ -150,29 +155,49 @@ private:
     ChunkedRemuxSession *retiringRemuxSession;
     // A merged file of the current remuxSession has been handed to the player.
     bool remuxPlaybackStarted;
-    // Seconds of the video covered by the file the player currently has
-    // loaded (only meaningful while playingPartialRemux).
+    // The merged file the player has loaded is chunks
+    // [playingStartChunk, playingStartChunk + playingChunkCount) of the
+    // session that produced it. Its own 0:00 is playingStartSec into the
+    // video; remuxPlayableSeconds is where its content ends (video time).
+    int playingStartChunk;
+    int playingChunkCount;
+    double playingStartSec;
     double remuxPlayableSeconds;
-    // The loaded file is a partial merge (the player will run out of data
-    // at remuxPlayableSeconds unless it is swapped for a longer one).
+    // The loaded file ends before the video does: the player will run out of
+    // data at remuxPlayableSeconds unless it is swapped for a longer one.
     bool playingPartialRemux;
-    // Position the person seeked to that is not downloaded yet (ms), 0 if none.
-    unsigned int remuxSeekTargetMs;
     bool remuxStallToastShown;
     // A longer merged file that is ready but not swapped in yet. Swapping
     // reloads the source, so it is done exactly when the player has played
     // the current file to its end: the new file then resumes on the keyframe
     // at that very boundary and nothing is repeated or skipped.
     QString pendingSwapPath;
-    double pendingSwapCovered;
+    int pendingSwapStart;
+    int pendingSwapCount;
     bool pendingSwapFinal;
     QPointer<ChunkedRemuxSession> pendingSwapSession;
     bool remuxRanDry; // player reached the end of the partial file
-    bool remuxSwapping; // inside swapToPendingFile(): ignore the state changes it causes
-    unsigned int lastPositionMs; // last position tick (the player's own value is unreliable at EOF)
+    bool remuxSwapping; // inside a source swap: ignore the state changes it causes
+    unsigned int lastPositionMs; // last position tick (video time; the player's own value is unreliable at EOF)
+    QTime lastPositionTickClock;
     double remuxLastMergeSeconds; // how long the last merge took, to start the next one early enough
     bool remuxMergeTimed;
     QTime remuxMergeClock;
+    QTimer *remuxWatchdog;
+    bool finalCopyRequested;
+    // Where the session starts downloading (saved position / current position).
+    double remuxStartAtSec;
+    int initialStartChunk;
+    // The person seeked to a place the loaded file does not contain: the
+    // download head was moved there, a loading indicator is shown, and the
+    // video resumes from seekTargetMs once a merged file covering it exists.
+    bool seekPending;
+    bool seekMergeRequested;
+    unsigned int seekTargetMs;
+    int seekChunk;
+    bool seekResumePlay;
+    bb::cascades::Container *seekLoadingOverlay;
+    bb::cascades::ActivityIndicator *seekLoadingSpinner;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
     void playVideo();
@@ -182,13 +207,19 @@ private:
     void showInfos();
     void setAudioOnly(bool audioOnly);
     void changeQuality(QString newQuality, QString url, bool forcePlay = false, int seekMs = -1);
-    void startPlaybackAt(QString url);
+    void startPlaybackAt(QString url, int offsetMs = 0, bool partial = false);
     void playVideoWithRemux(SingleVideoStorageData videoData);
     void changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData);
-    void startRemuxSession(SingleVideoStorageData videoData);
+    void startRemuxSession(SingleVideoStorageData videoData, double startAtSeconds);
     void clearRemuxSessions(); // cancels+deletes remuxSession and retiringRemuxSession, if present
     void maybeRequestRemuxMerge();
-    void queuePendingSwap(ChunkedRemuxSession *session, QString path, double covered, bool isFinal);
+    void queuePendingSwap(ChunkedRemuxSession *session, QString path, int startChunk, int chunkCount, bool isFinal);
+    void loadMergedFile(QString label, QString path, ChunkedRemuxSession *session, int startChunk, int chunkCount, bool isFinal, double resumeFileSeconds, double resumeAbsSeconds, bool forcePlay);
+    ChunkedRemuxSession *playingSession();
+    void beginRemuxSeek(unsigned int positionMs);
+    void requestSeekMerge();
+    void showSeekLoading(bool show);
+    void maybeRequestFinalCopy();
     void swapToPendingFile();
     void markMergeRequested();
     void seekWithinPlayable(unsigned int positionMs);

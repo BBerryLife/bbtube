@@ -29,6 +29,7 @@
 
 #include <bb/cascades/Page>
 #include <bb/cascades/Container>
+#include <bb/cascades/ActivityIndicator>
 #include <bb/cascades/DockLayout>
 #include <bb/cascades/StackLayout>
 #include <bb/cascades/StackLayoutProperties>
@@ -113,17 +114,32 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     this->remuxSession = 0;
     this->retiringRemuxSession = 0;
     this->remuxPlaybackStarted = false;
+    this->playingStartChunk = 0;
+    this->playingChunkCount = 0;
+    this->playingStartSec = 0;
     this->remuxPlayableSeconds = 0;
     this->playingPartialRemux = false;
-    this->remuxSeekTargetMs = 0;
     this->remuxStallToastShown = false;
-    this->pendingSwapCovered = 0;
+    this->pendingSwapStart = 0;
+    this->pendingSwapCount = 0;
     this->pendingSwapFinal = false;
     this->remuxRanDry = false;
     this->remuxSwapping = false;
     this->lastPositionMs = 0;
     this->remuxLastMergeSeconds = 0;
     this->remuxMergeTimed = false;
+    this->finalCopyRequested = false;
+    this->remuxStartAtSec = 0;
+    this->initialStartChunk = -1;
+    this->seekPending = false;
+    this->seekMergeRequested = false;
+    this->seekTargetMs = 0;
+    this->seekChunk = -1;
+    this->seekResumePlay = false;
+    this->seekLoadingOverlay = 0;
+    this->seekLoadingSpinner = 0;
+    this->remuxWatchdog = new QTimer(this);
+    QObject::connect(remuxWatchdog, SIGNAL(timeout()), this, SLOT(onRemuxWatchdog()));
     this->pendingRemuxQualityLabel = "";
 
     root->setLayout(new bb::cascades::DockLayout());
@@ -168,6 +184,21 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     backgroundImage->setImageSource(QString("asset:///images/player_background.png"));
     audioBackground->add(backgroundImage);
     root->add(audioBackground);
+
+    // Shown while waiting for a part of the video that is not downloaded yet
+    // (the person seeked there); the earlier, already downloaded parts stay.
+    seekLoadingOverlay = new bb::cascades::Container();
+    seekLoadingOverlay->setVerticalAlignment(bb::cascades::VerticalAlignment::Center);
+    seekLoadingOverlay->setHorizontalAlignment(bb::cascades::HorizontalAlignment::Center);
+    seekLoadingOverlay->setLayout(new bb::cascades::DockLayout());
+    seekLoadingSpinner = bb::cascades::ActivityIndicator::create();
+    seekLoadingSpinner->setVerticalAlignment(bb::cascades::VerticalAlignment::Center);
+    seekLoadingSpinner->setHorizontalAlignment(bb::cascades::HorizontalAlignment::Center);
+    seekLoadingSpinner->setPreferredWidth(ui->du(20));
+    seekLoadingSpinner->setPreferredHeight(ui->du(20));
+    seekLoadingOverlay->add(seekLoadingSpinner);
+    seekLoadingOverlay->setVisible(false);
+    root->add(seekLoadingOverlay);
 
     infoContainer = bb::cascades::Container::create();
     infoContainer->setLeftPadding(ui->du(1));
@@ -373,6 +404,8 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
             this, SLOT(onMediaStateChanged(bb::multimedia::MediaState::Type)));
     QObject::connect(playerContext, SIGNAL(positionChanged(unsigned int)), this,
             SLOT(onPlayerPositionChanged(unsigned int)));
+    QObject::connect(playerContext, SIGNAL(seekRequested(unsigned int)), this,
+            SLOT(onSeekRequested(unsigned int)));
     QObject::connect(playerContext, SIGNAL(npcPrev()), this, SLOT(onNpcPrev()));
     QObject::connect(playerContext, SIGNAL(npcNext()), this, SLOT(onNpcNext()));
     QObject::connect(playerContext, SIGNAL(orientationChanged()), this,
@@ -592,12 +625,15 @@ void PlayerPage::onMediaStateChanged(bb::multimedia::MediaState::Type state)
         bool reachedEnd = !isLiveStream && duration > 0 && !playingPartialRemux
                 && positionMs >= (unsigned int) (duration * 1000 - 1500);
 
-        if (playingPartialRemux && !isLiveStream && !remuxSwapping) {
+        if (playingPartialRemux && !isLiveStream && !remuxSwapping && !seekPending) {
             // "Stopped" near the end of a partial file == the player ran out
             // of downloaded data. The player's own position is unreliable
             // right at the end, so use the last tick as well.
             unsigned int seenMs = positionMs > lastPositionMs ? positionMs : lastPositionMs;
-            if (seenMs / 1000.0 >= remuxPlayableSeconds - 2.5) {
+            qDebug() << "[bbtube][chunk] player stopped at" << positionMs / 1000.0 << "s (last tick"
+                     << lastPositionMs / 1000.0 << "s), file ends at" << remuxPlayableSeconds
+                     << "s, next file ready:" << (pendingSwapPath.isEmpty() ? "no" : "yes");
+            if (seenMs / 1000.0 >= remuxPlayableSeconds - 4.0) {
                 remuxRanDry = true;
                 if (!pendingSwapPath.isEmpty()) {
                     swapToPendingFile();
@@ -702,6 +738,11 @@ void PlayerPage::onMetadataReceived(VideoMetadata videoMetadata, StorageData sto
 
 void PlayerPage::playVideo()
 {
+    if (!alreadyPlaying) {
+        // A new video (e.g. next in the playlist): stop downloading the previous one.
+        clearRemuxSessions();
+        pendingRemuxQualityLabel = "";
+    }
     setInfos();
 
     if (storageData.instances.count() > 0) {
@@ -790,12 +831,19 @@ void PlayerPage::playVideo()
     }
 }
 
-void PlayerPage::startPlaybackAt(QString url)
+void PlayerPage::startPlaybackAt(QString url, int offsetMs, bool partial)
 {
-    playingPartialRemux = false; // callers that play a partial merged file set it afterwards
-    lastPositionMs = 0;
+    playingPartialRemux = partial;
+    playingStartSec = offsetMs / 1000.0;
+    lastPositionMs = (unsigned int) offsetMs;
     bb::multimedia::MediaError::Type error = playerContext->play(url);
     if (error == bb::multimedia::MediaError::None) {
+        // A remuxed window of the video: positions are video time.
+        bool windowed = partial || offsetMs > 0;
+        playerContext->setTimeline(offsetMs, windowed ? duration : 0);
+        playerContext->setPartialSource(partial);
+        playerContext->setSeekIntercept(windowed);
+
         addToHistory();
 
         if (watched.count() == 0 || watched.last() != videoMetadata.video.videoId) {
@@ -817,23 +865,47 @@ void PlayerPage::startPlaybackAt(QString url)
     }
 }
 
-// How close (seconds) the player may get to the end of the file it has
-// loaded before the next, longer merged file is requested.
-static const double REMUX_SWAP_LEAD_SECONDS = 10.0;
+// How early (seconds before the loaded file runs out) the next, longer merged
+// file is requested. It grows with how long the last merge took.
+static const double REMUX_SWAP_LEAD_BASE_SECONDS = 4.0;
 // A quality switch only takes over once the new file reaches this far past
 // the current position (so the switch doesn't immediately run dry).
 static const double REMUX_QUALITY_SWITCH_AHEAD_SECONDS = 8.0;
+// A seek into stored material loads a file that starts at most this far
+// before the target (keeps merged files, and therefore loading, small).
+static const double REMUX_SEEK_FILE_BACK_SECONDS = 60.0;
 
 void PlayerPage::playVideoWithRemux(SingleVideoStorageData videoData)
 {
     pendingRemuxQualityLabel = ""; // "" == this is an initial playback, not a mid-playback quality switch
-    startRemuxSession(videoData);
+    double startAt = 0;
+    if (playerContext->isContinuePlaying() && duration > 0) {
+        // Resume where the person stopped: download from there, not from 0:00.
+        startAt = (0.0
+                + VideoViewedPercentProxy::getInstance()->getPercent(videoMetadata.video.videoId))
+                * duration / 10000.0 / 1000.0;
+        if (startAt < 0) startAt = 0;
+    }
+    startRemuxSession(videoData, startAt);
 }
 
 void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData)
 {
     pendingRemuxQualityLabel = newQuality;
-    startRemuxSession(videoData);
+    startRemuxSession(videoData, playerContext->getPosition() / 1000.0);
+}
+
+ChunkedRemuxSession *PlayerPage::playingSession()
+{
+    // While a quality switch is under way the loaded file still comes from the old session.
+    return retiringRemuxSession ? retiringRemuxSession : remuxSession;
+}
+
+void PlayerPage::showSeekLoading(bool show)
+{
+    if (!seekLoadingOverlay) return;
+    seekLoadingOverlay->setVisible(show);
+    if (show) seekLoadingSpinner->start(); else seekLoadingSpinner->stop();
 }
 
 void PlayerPage::clearRemuxSessions()
@@ -853,15 +925,23 @@ void PlayerPage::clearRemuxSessions()
         retiringRemuxSession->deleteLater();
         retiringRemuxSession = 0;
     }
+    if (remuxWatchdog) remuxWatchdog->stop();
     remuxPlaybackStarted = false;
+    playingStartChunk = 0;
+    playingChunkCount = 0;
+    playingStartSec = 0;
     remuxPlayableSeconds = 0;
     playingPartialRemux = false;
-    remuxSeekTargetMs = 0;
     remuxStallToastShown = false;
     pendingSwapPath = "";
     pendingSwapSession = 0;
     remuxRanDry = false;
     remuxSwapping = false;
+    finalCopyRequested = false;
+    initialStartChunk = -1;
+    seekPending = false;
+    seekMergeRequested = false;
+    showSeekLoading(false);
 }
 
 // Drops merged/staging files nobody will need again (this app never cleaned
@@ -878,14 +958,14 @@ static void cleanupRemuxCache(const QString &dirPath)
     }
 }
 
-void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
+void PlayerPage::startRemuxSession(SingleVideoStorageData videoData, double startAtSeconds)
 {
     QString base = remuxBaseNameFor(videoMetadata.video.videoId, videoData.quality);
     QString cacheDir = remuxCacheDir();
     cleanupRemuxCache(cacheDir);
 
     if (pendingRemuxQualityLabel != "" && remuxSession && !remuxSession->hasFailed()
-            && !remuxSession->isDownloadComplete()) {
+            && !remuxSession->isDownloadComplete() && playingPartialRemux) {
         // Mid-playback quality switch while the current quality's file is
         // still growing: keep that session alive (it feeds the file the
         // player is reading) until the new quality's first file takes over.
@@ -899,108 +979,183 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
     } else {
         // Initial playback / new video, or the old file is already complete.
         bool keepPlayingState = (pendingRemuxQualityLabel != "");
-        bool wasPartial = playingPartialRemux;
-        double playable = remuxPlayableSeconds;
+        int s0 = playingStartChunk, c0 = playingChunkCount;
+        double st0 = playingStartSec, pl0 = remuxPlayableSeconds;
+        bool part0 = playingPartialRemux, started0 = remuxPlaybackStarted;
         clearRemuxSessions();
         if (keepPlayingState) {
-            playingPartialRemux = wasPartial;
-            remuxPlayableSeconds = playable;
+            playingStartChunk = s0;
+            playingChunkCount = c0;
+            playingStartSec = st0;
+            remuxPlayableSeconds = pl0;
+            playingPartialRemux = part0;
+            remuxPlaybackStarted = started0;
         }
     }
 
+    remuxStartAtSec = startAtSeconds;
+    initialStartChunk = -1;
     remuxSession = new ChunkedRemuxSession(ApplicationUI::networkManager, videoData.url,
-            storageData.audio.url, cacheDir, base, this, 5.0);
+            storageData.audio.url, cacheDir, base, this, 5.0, startAtSeconds);
 
-    QObject::connect(remuxSession, SIGNAL(progress(double, double)), this,
-            SLOT(onRemuxProgress(double, double)));
-    QObject::connect(remuxSession, SIGNAL(mergedReady(QString, double, bool)), this,
-            SLOT(onRemuxMerged(QString, double, bool)));
+    QObject::connect(remuxSession, SIGNAL(progress(int)), this, SLOT(onRemuxProgress(int)));
+    QObject::connect(remuxSession, SIGNAL(mergedReady(QString, int, int, bool)), this,
+            SLOT(onRemuxMerged(QString, int, int, bool)));
     QObject::connect(remuxSession, SIGNAL(failed(QString)), this, SLOT(onRemuxFailed(QString)));
 
     remuxSession->start();
 }
 
-// Decides whether it is time to ask the session for a newer merged file.
-//
-// A merged file is only ever swapped in when needed -- every swap reloads the
-// source, which costs a short hiccup -- i.e. when the player is about to run
-// out of the data it has (or has already stopped because it did). The very
-// first file is requested as soon as the first chunk is downloaded.
 void PlayerPage::markMergeRequested()
 {
     remuxMergeClock.start();
     remuxMergeTimed = true;
 }
 
-// Decides whether it is time to ask the session for a newer merged file.
+// Decides whether it is time to ask for a (newer) merged file.
 //
-// A newer file is only ever SWAPPED IN when the player has run out of the
-// current one (see swapToPendingFile()), so it has to exist by then: it is
-// requested while the player is still `lead` seconds from the end, where
-// `lead` grows with how long the last merge took (copying a big file takes
-// longer than copying a small one). The very first file is requested as soon
-// as the first chunk is downloaded.
+// A newer file for the CURRENT playback is only ever swapped in when the
+// player has run out of the one it has (see swapToPendingFile()), so it has
+// to exist by then: it is requested while the player is still `lead` seconds
+// from the end, where `lead` grows with how long the last merge took. Exactly
+// one merge is made per swap -- earlier versions re-merged after every
+// downloaded chunk (copying tens of MB each time) while one was already
+// waiting. The very first file is requested as soon as its chunk is stored.
 void PlayerPage::maybeRequestRemuxMerge()
 {
-    double posSec = (playerContext->getPosition() > (int) lastPositionMs ?
-            (unsigned int) playerContext->getPosition() : lastPositionMs) / 1000.0;
-    double lead = REMUX_SWAP_LEAD_SECONDS + 2.0 * remuxLastMergeSeconds;
-    if (lead > 45.0) lead = 45.0;
+    if (seekPending) return; // seek handling drives merging while a seek is outstanding
 
-    // Seconds already covered by the file in the player or by one waiting to be swapped in.
-    double haveSec = remuxPlayableSeconds;
-    if (!pendingSwapPath.isEmpty() && pendingSwapCovered > haveSec) {
-        haveSec = pendingSwapCovered;
+    unsigned int posMs = (unsigned int) playerContext->getPosition();
+    if (lastPositionMs > posMs) posMs = lastPositionMs;
+    double posSec = posMs / 1000.0;
+    double lead = REMUX_SWAP_LEAD_BASE_SECONDS + 2.0 * remuxLastMergeSeconds;
+    if (lead > 30.0) lead = 30.0;
+
+    // The file in the player: extend it when it is about to run out.
+    ChunkedRemuxSession *ps = playingSession();
+    if (ps && remuxPlaybackStarted && playingPartialRemux && pendingSwapPath.isEmpty()
+            && !ps->isMerging() && ps->headsReady()) {
+        int end = playingStartChunk + playingChunkCount;
+        if (ps->runEnd(playingStartChunk) > end && remuxPlayableSeconds - posSec < lead) {
+            markMergeRequested();
+            ps->requestMerge(playingStartChunk);
+        }
     }
 
-    // Old quality still playing while the new one catches up: keep feeding it.
-    if (retiringRemuxSession && playingPartialRemux && !retiringRemuxSession->isMerging()
-            && retiringRemuxSession->downloadedSeconds() > haveSec + 0.5
-            && remuxPlayableSeconds - posSec < lead) {
-        markMergeRequested();
-        retiringRemuxSession->requestMerge();
-    }
-
-    if (!remuxSession || remuxSession->isMerging()) return;
-    double downloaded = remuxSession->downloadedSeconds();
-    if (downloaded <= 0) return;
+    if (!remuxSession || !remuxSession->headsReady()) return;
+    if (initialStartChunk < 0) initialStartChunk = remuxSession->chunkIndexAt(remuxStartAtSec);
 
     if (pendingRemuxQualityLabel != "") {
         // Quality switch: wait until the new file reaches well past the
         // current position, or is complete.
-        if (remuxSession->isDownloadComplete()
-                || downloaded >= posSec + REMUX_QUALITY_SWITCH_AHEAD_SECONDS + 2.0) {
+        if (remuxSession->isMerging() || !remuxSession->isChunkStored(initialStartChunk)) return;
+        int end = remuxSession->runEnd(initialStartChunk);
+        double coveredEnd = remuxSession->chunkEndSeconds(end - 1);
+        if (end == remuxSession->chunkCount()
+                || coveredEnd >= posSec + REMUX_QUALITY_SWITCH_AHEAD_SECONDS + 2.0) {
             markMergeRequested();
-            remuxSession->requestMerge();
+            remuxSession->requestMerge(initialStartChunk);
         }
         return;
     }
     if (!remuxPlaybackStarted) {
-        markMergeRequested();
-        remuxSession->requestMerge();
+        if (!remuxSession->isMerging() && remuxSession->isChunkStored(initialStartChunk)) {
+            markMergeRequested();
+            remuxSession->requestMerge(initialStartChunk);
+        }
         return;
     }
-    if (!playingPartialRemux) return; // already playing the complete file
-    if (downloaded > haveSec + 0.5 && remuxPlayableSeconds - posSec < lead) {
-        markMergeRequested();
-        remuxSession->requestMerge();
-    }
+    maybeRequestFinalCopy();
 }
 
-void PlayerPage::onRemuxProgress(double downloadedSeconds, double totalSeconds)
+// Once the whole video is stored and the person is playing a file that does not
+// start at 0:00, still produce the complete cached file for next time.
+void PlayerPage::maybeRequestFinalCopy()
 {
-    Q_UNUSED(downloadedSeconds);
-    Q_UNUSED(totalSeconds);
+    if (finalCopyRequested || !remuxSession || seekPending || remuxSession->isMerging()) return;
+    if (!remuxSession->isDownloadComplete() || remuxSession != playingSession()) return;
+    if (playingStartChunk == 0 && !playingPartialRemux) return; // already playing the final file
+    finalCopyRequested = true;
+    remuxSession->requestMerge(0);
+}
+
+void PlayerPage::onRemuxProgress(int chunkIndex)
+{
+    Q_UNUSED(chunkIndex);
+    if (seekPending) {
+        if (!seekMergeRequested && remuxSession && remuxSession->isChunkStored(seekChunk)) {
+            requestSeekMerge();
+        }
+        return;
+    }
     maybeRequestRemuxMerge();
+}
+
+void PlayerPage::requestSeekMerge()
+{
+    if (!remuxSession || seekChunk < 0) return;
+    seekMergeRequested = true;
+    int a = remuxSession->fileStartFor(seekChunk, REMUX_SEEK_FILE_BACK_SECONDS);
+    qDebug() << "[bbtube][chunk] seek: chunk" << seekChunk << "is stored, merging file starting at chunk" << a;
+    markMergeRequested();
+    remuxSession->requestMerge(a);
+}
+
+// Hands a merged file to the player.
+//   resumeFileSeconds: where to resume, in the file's own timeline
+//   resumeAbsSeconds:  the same instant in video time (ignored for cached final files)
+void PlayerPage::loadMergedFile(QString label, QString path, ChunkedRemuxSession *session,
+        int startChunk, int chunkCount, bool isFinal, double resumeFileSeconds,
+        double resumeAbsSeconds, bool forcePlay)
+{
+    bool reachesEnd = isFinal || chunkCount < 0
+            || (session && startChunk + chunkCount >= session->chunkCount());
+    double startSec = (chunkCount < 0 || !session) ? 0.0 : session->chunkStartSeconds(startChunk);
+    double endSec = reachesEnd ? 1e9 : session->chunkEndSeconds(startChunk + chunkCount - 1);
+
+    playingStartChunk = startChunk;
+    playingChunkCount = chunkCount;
+    playingStartSec = startSec;
+    remuxPlayableSeconds = endSec;
+    playingPartialRemux = !reachesEnd;
+    bool windowed = playingPartialRemux || startSec > 0.01;
+
+    int offsetMs = (int) (startSec * 1000.0 + 0.5);
+    int absMs = (int) ((startSec + resumeFileSeconds) * 1000.0 + 0.5);
+    if (resumeAbsSeconds >= 0) absMs = (int) (resumeAbsSeconds * 1000.0 + 0.5);
+
+    remuxSwapping = true;
+    playerContext->setTimeline(offsetMs, windowed ? duration : 0);
+    playerContext->setPartialSource(playingPartialRemux);
+    playerContext->setSeekIntercept(windowed);
+    changeQuality(label, path, forcePlay, absMs);
+    remuxSwapping = false;
+
+    remuxStallToastShown = false;
+    remuxRanDry = false;
+    lastPositionMs = (unsigned int) absMs;
+    lastPositionTickClock.start();
+    if (windowed && !remuxWatchdog->isActive()) remuxWatchdog->start(1000);
+    qDebug() << "[bbtube][chunk] loaded" << path << ": chunks" << startChunk << "+" << chunkCount
+             << ", file starts at video" << startSec << "s, ends at" << (reachesEnd ? -1.0 : endSec)
+             << "s, resuming at" << absMs / 1000.0 << "s, forcePlay" << forcePlay;
 }
 
 // A longer file is ready. Hand it to the player right away only if the
 // player is already out of data; otherwise keep it until it is.
-void PlayerPage::queuePendingSwap(ChunkedRemuxSession *session, QString path, double covered,
-        bool isFinal)
+void PlayerPage::queuePendingSwap(ChunkedRemuxSession *session, QString path, int startChunk,
+        int chunkCount, bool isFinal)
 {
+    int curEnd = playingStartChunk + playingChunkCount;
+    // Only a file that begins at or before the current one and reaches further is a continuation.
+    if (startChunk > playingStartChunk || startChunk + chunkCount <= curEnd) {
+        qDebug() << "[bbtube][chunk] ignoring merged file chunks" << startChunk << "+" << chunkCount
+                 << "- not an extension of" << playingStartChunk << "+" << playingChunkCount;
+        return;
+    }
     pendingSwapPath = path;
-    pendingSwapCovered = covered;
+    pendingSwapStart = startChunk;
+    pendingSwapCount = chunkCount;
     pendingSwapFinal = isFinal;
     pendingSwapSession = session;
 
@@ -1009,9 +1164,9 @@ void PlayerPage::queuePendingSwap(ChunkedRemuxSession *session, QString path, do
     if (remuxRanDry || (started && remuxPlayableSeconds - posSec < 0.35)) {
         swapToPendingFile();
     } else {
-        qDebug() << "[bbtube][chunk] next file ready (covers" << covered
-                 << "s), waiting for the player to reach the end of the current one at"
-                 << remuxPlayableSeconds << "s";
+        qDebug() << "[bbtube][chunk] next file ready (chunks" << startChunk << "+" << chunkCount
+                 << "), waiting for the player to reach the end of the current one at"
+                 << remuxPlayableSeconds << "s; player at" << posSec << "s";
     }
 }
 
@@ -1019,60 +1174,85 @@ void PlayerPage::swapToPendingFile()
 {
     if (pendingSwapPath.isEmpty() || pendingSwapSession.isNull() || remuxSwapping) return;
     QString path = pendingSwapPath;
-    double covered = pendingSwapCovered;
+    int start = pendingSwapStart, count = pendingSwapCount;
     bool isFinal = pendingSwapFinal;
     ChunkedRemuxSession *session = pendingSwapSession;
     pendingSwapPath = "";
     pendingSwapSession = 0;
 
-    // The old file ended exactly at a chunk boundary == a keyframe of the
-    // new file. Resume there (not at the player's own idea of the position,
-    // which a mid-GOP seek would turn into a rewind to the previous keyframe).
-    double resume = session->keyframeResumeSeconds(remuxPlayableSeconds);
-    unsigned int resumeMs = (unsigned int) (resume * 1000.0 + 0.5);
+    // The old file ended exactly at a chunk boundary == a keyframe of the new
+    // file. Resume there (not at the player's own idea of the position, which
+    // a mid-GOP seek would turn into a rewind to the previous keyframe).
+    int boundary = playingStartChunk + playingChunkCount;
+    double resume = session->fileResumeSeconds(start, boundary);
+    qDebug() << "[bbtube][chunk] swapping: old file ended at" << remuxPlayableSeconds
+             << "s (player at" << lastPositionMs / 1000.0 << "s), boundary chunk" << boundary;
+    loadMergedFile(quality, path, session, start, count, isFinal, resume, -1.0, true);
 
-    remuxSwapping = true;
-    changeQuality(quality, path, true, (int) resumeMs);
-    remuxSwapping = false;
-
-    playingPartialRemux = !isFinal;
-    playerContext->setPartialSource(playingPartialRemux);
-    qDebug() << "[bbtube][chunk] swapped: old file ended at" << remuxPlayableSeconds
-             << "s, new file covers" << covered << "s, resuming at" << resume << "s";
-    remuxPlayableSeconds = covered;
-    remuxStallToastShown = false;
-    remuxRanDry = false;
-    lastPositionMs = resumeMs;
-
-    if (remuxSeekTargetMs > 0 && (remuxSeekTargetMs / 1000.0) + 1.0 < covered) {
-        playerContext->seekTime(remuxSeekTargetMs);
-        lastPositionMs = remuxSeekTargetMs;
-        remuxSeekTargetMs = 0;
-    }
     maybeRequestRemuxMerge();
 }
 
-void PlayerPage::onRemuxMerged(QString path, double coveredSeconds, bool isFinal)
+void PlayerPage::onRemuxMerged(QString path, int startChunk, int chunkCount, bool isFinal)
 {
     ChunkedRemuxSession *src = qobject_cast<ChunkedRemuxSession *>(QObject::sender());
-    // coveredSeconds is 0 for a cache hit (complete file, length not parsed).
-    double covered = (isFinal || coveredSeconds <= 0) ? 1e9 : coveredSeconds;
-    double posSec = playerContext->getPosition() / 1000.0;
 
     if (remuxMergeTimed) {
         remuxLastMergeSeconds = remuxMergeClock.elapsed() / 1000.0;
         remuxMergeTimed = false;
     }
 
+    // A longer file of the quality that is still playing (during a quality switch).
     if (src && src == retiringRemuxSession) {
-        // A longer file of the quality that is still playing.
-        queuePendingSwap(src, path, covered, isFinal);
+        if (!seekPending) queuePendingSwap(src, path, startChunk, chunkCount, isFinal);
         return;
     }
     if (!remuxSession) return;
 
+    double posSec = playerContext->getPosition() / 1000.0;
+
+    // ---- the person seeked somewhere the loaded file does not contain ----
+    if (seekPending && chunkCount >= 0) {
+        double T = seekTargetMs / 1000.0;
+        double fs = remuxSession->chunkStartSeconds(startChunk);
+        bool reachesEnd = isFinal || startChunk + chunkCount >= remuxSession->chunkCount();
+        double fe = reachesEnd ? 1e9 : remuxSession->chunkEndSeconds(startChunk + chunkCount - 1);
+        if (T >= fs - 0.001 && T < fe - 0.5) {
+            QString label = pendingRemuxQualityLabel != "" ? pendingRemuxQualityLabel : quality;
+            pendingRemuxQualityLabel = "";
+            pendingSwapPath = "";
+            pendingSwapSession = 0;
+            remuxPlaybackStarted = true;
+            bool resumePlay = seekResumePlay;
+            seekPending = false;
+            seekMergeRequested = false;
+            showSeekLoading(false);
+            loadMergedFile(label, path, remuxSession, startChunk, chunkCount, isFinal, T - fs, T,
+                    resumePlay);
+            if (retiringRemuxSession) {
+                QObject::disconnect(retiringRemuxSession, 0, this, 0);
+                retiringRemuxSession->cancel();
+                retiringRemuxSession->deleteLater();
+                retiringRemuxSession = 0;
+            }
+            progressSlider->setValue((int) seekTargetMs);
+            maybeRequestRemuxMerge();
+        } else {
+            // Stale file (built before the target chunk was stored, or the
+            // target sits right at its end): ask again once more data arrived.
+            qDebug() << "[bbtube][chunk] merged file does not cover the seek target" << T << "s";
+            seekMergeRequested = false;
+            if (remuxSession->isChunkStored(seekChunk)) requestSeekMerge();
+        }
+        return;
+    }
+
     if (pendingRemuxQualityLabel != "") {
-        if (!isFinal && covered < posSec + 4.0) {
+        // ---- quality switch: the new quality's first file ----
+        double fs = chunkCount < 0 ? 0.0 : remuxSession->chunkStartSeconds(startChunk);
+        bool reachesEnd = isFinal || chunkCount < 0
+                || startChunk + chunkCount >= remuxSession->chunkCount();
+        double fe = reachesEnd ? 1e9 : remuxSession->chunkEndSeconds(startChunk + chunkCount - 1);
+        if (!reachesEnd && fe < posSec + 4.0) {
             // The player outran this file while it was being merged; wait for a longer one.
             maybeRequestRemuxMerge();
             return;
@@ -1081,19 +1261,26 @@ void PlayerPage::onRemuxMerged(QString path, double coveredSeconds, bool isFinal
         pendingRemuxQualityLabel = "";
         // A different quality is a different file with its own keyframes:
         // resume on the keyframe nearest to where the reload will finish.
-        double resume = remuxSession->keyframeResumeSeconds(posSec + 1.5);
-        remuxSwapping = true;
-        changeQuality(newQuality, path, false, (int) (resume * 1000.0 + 0.5));
-        remuxSwapping = false;
+        double target = posSec + 1.5;
+        double resumeFile = 0.0, resumeAbs = -1.0;
+        if (chunkCount >= 0) {
+            int b = remuxSession->chunkIndexAt(target);
+            if (b + 1 < startChunk + chunkCount
+                    && remuxSession->chunkEndSeconds(b) - target < target - remuxSession->chunkStartSeconds(b)) {
+                b++; // the next boundary is closer
+            }
+            if (b < startChunk) b = startChunk;
+            if (b >= startChunk + chunkCount) b = startChunk + chunkCount - 1;
+            resumeFile = remuxSession->fileResumeSeconds(startChunk, b);
+            (void) fs;
+        } else {
+            resumeAbs = target; // complete cached file: plain position
+        }
         pendingSwapPath = "";
         pendingSwapSession = 0;
         remuxPlaybackStarted = true;
-        playingPartialRemux = !isFinal;
-        playerContext->setPartialSource(playingPartialRemux);
-        remuxPlayableSeconds = covered;
-        remuxStallToastShown = false;
-        remuxRanDry = false;
-        lastPositionMs = (unsigned int) (resume * 1000.0);
+        loadMergedFile(newQuality, path, remuxSession, startChunk, chunkCount, isFinal, resumeFile,
+                resumeAbs, false);
         if (retiringRemuxSession) {
             QObject::disconnect(retiringRemuxSession, 0, this, 0);
             retiringRemuxSession->cancel();
@@ -1101,16 +1288,28 @@ void PlayerPage::onRemuxMerged(QString path, double coveredSeconds, bool isFinal
             retiringRemuxSession = 0;
         }
     } else if (!remuxPlaybackStarted) {
-        startPlaybackAt(path); // resets playingPartialRemux
+        // ---- the very first file ----
         remuxPlaybackStarted = true;
-        playingPartialRemux = !isFinal;
-        playerContext->setPartialSource(playingPartialRemux);
-        remuxPlayableSeconds = covered;
+        bool reachesEnd = isFinal || chunkCount < 0
+                || startChunk + chunkCount >= remuxSession->chunkCount();
+        double startSec = chunkCount < 0 ? 0.0 : remuxSession->chunkStartSeconds(startChunk);
+        double endSec = reachesEnd ? 1e9 : remuxSession->chunkEndSeconds(startChunk + chunkCount - 1);
+        playingStartChunk = startChunk;
+        playingChunkCount = chunkCount;
+        playingStartSec = startSec;
+        remuxPlayableSeconds = endSec;
+        playingPartialRemux = !reachesEnd;
+        startPlaybackAt(path, (int) (startSec * 1000.0 + 0.5), playingPartialRemux);
         remuxStallToastShown = false;
         remuxRanDry = false;
-        qDebug() << "[bbtube][chunk] player now has" << path << "covering" << covered << "s final:" << isFinal;
+        lastPositionTickClock.start();
+        if ((playingPartialRemux || startSec > 0.01) && !remuxWatchdog->isActive()) remuxWatchdog->start(1000);
+        qDebug() << "[bbtube][chunk] first file loaded:" << path << "chunks" << startChunk << "+" << chunkCount
+                 << ", video time" << startSec << "to" << (reachesEnd ? -1.0 : endSec) << "s";
+    } else if (playingPartialRemux) {
+        queuePendingSwap(src, path, startChunk, chunkCount, isFinal);
     } else {
-        queuePendingSwap(src, path, covered, isFinal);
+        qDebug() << "[bbtube][chunk] merged file ready" << path << "(not needed for playback)";
     }
 
     // The player may already be close to the end of this file (slow link).
@@ -1130,35 +1329,111 @@ void PlayerPage::onRemuxFailed(QString errorMessage)
         // Something is already playing; keep whatever was downloaded so far
         // watchable. Make one last merge of everything that arrived.
         UIUtils::toastError("Download interrupted");
-        if (remuxSession) {
-            remuxSession->requestMerge();
+        if (seekPending) {
+            seekPending = false;
+            seekMergeRequested = false;
+            showSeekLoading(false);
+            if (seekResumePlay) playerContext->play();
+        }
+        if (remuxSession && playingPartialRemux) {
+            remuxSession->requestMerge(playingStartChunk);
         }
     }
     pendingRemuxQualityLabel = "";
     if (retiringRemuxSession) {
+        QObject::disconnect(retiringRemuxSession, 0, this, 0);
         retiringRemuxSession->cancel();
         retiringRemuxSession->deleteLater();
         retiringRemuxSession = 0;
     }
 }
 
-// Seeking to something that has not been downloaded yet would just park the
-// player at the end of its file; remember the wish, play up to the end of
-// what exists, and jump there as soon as a longer file is swapped in.
+// ---------------------------------------------------------------------------
+// Seeking
+// ---------------------------------------------------------------------------
+void PlayerPage::onSeekRequested(unsigned int positionMs)
+{
+    seekWithinPlayable(positionMs);
+}
+
+// A seek inside the loaded file is a plain seek. Anything else -- later than
+// what is downloaded, or in a part the loaded file does not contain -- moves
+// the download head there, shows a loading indicator, and plays from there as
+// soon as a file covering it exists. Everything downloaded earlier is kept.
 void PlayerPage::seekWithinPlayable(unsigned int positionMs)
 {
-    if (playingPartialRemux && positionMs / 1000.0 > remuxPlayableSeconds - 1.5) {
-        remuxSeekTargetMs = positionMs;
-        double safe = remuxPlayableSeconds - 2.0;
-        positionMs = safe > 0 ? (unsigned int) (safe * 1000) : 0;
+    double t = positionMs / 1000.0;
+    bool windowed = playingPartialRemux || playingStartSec > 0.01;
+    ChunkedRemuxSession *s = remuxSession;
+    if (!windowed || !s || !s->headsReady() || isLiveStream) {
+        playerContext->seekTimeDirect(positionMs);
+        return;
+    }
+    if (t >= playingStartSec && t <= remuxPlayableSeconds - 1.5 && !seekPending) {
+        playerContext->seekTimeDirect(positionMs);
+        return;
+    }
+    beginRemuxSeek(positionMs);
+}
+
+void PlayerPage::beginRemuxSeek(unsigned int positionMs)
+{
+    ChunkedRemuxSession *s = remuxSession;
+    double t = positionMs / 1000.0;
+    if (t * 1000.0 > duration) t = duration / 1000.0;
+
+    if (!seekPending) {
+        bb::multimedia::MediaState::Type st = playerContext->getMediaState();
+        seekResumePlay = (st == bb::multimedia::MediaState::Started) || remuxRanDry;
+        playerContext->pause(); // freezes the old file: no more position ticks while loading
+    }
+    seekPending = true;
+    seekMergeRequested = false;
+    seekTargetMs = (unsigned int) (t * 1000.0);
+    pendingSwapPath = "";
+    pendingSwapSession = 0;
+    remuxRanDry = false;
+    showSeekLoading(true);
+    if (!manualSeeking) progressSlider->setValue((int) seekTargetMs);
+
+    seekChunk = s->seekTo(t);
+    qDebug() << "[bbtube][chunk] seek requested to" << t << "s -> chunk" << seekChunk
+             << (s->isChunkStored(seekChunk) ? "(already stored)" : "(downloading from there)");
+    if (s->isChunkStored(seekChunk)) {
+        requestSeekMerge();
+    }
+}
+
+// Once a second while a remux file is playing: catches a player that has
+// stopped (or frozen) at the end of its file without the state change we
+// normally react to, so the next file is still swapped in.
+void PlayerPage::onRemuxWatchdog()
+{
+    if (!(playingPartialRemux) || seekPending || remuxSwapping || !remuxPlaybackStarted) return;
+
+    bb::multimedia::MediaState::Type st = playerContext->getMediaState();
+    unsigned int posMs = (unsigned int) playerContext->getPosition();
+    if (lastPositionMs > posMs) posMs = lastPositionMs;
+    bool nearEnd = posMs / 1000.0 >= remuxPlayableSeconds - 4.0;
+    bool stuck = (st == bb::multimedia::MediaState::Stopped)
+            || (st == bb::multimedia::MediaState::Started && lastPositionTickClock.elapsed() > 2500);
+    if (!nearEnd || !stuck) return;
+
+    if (!remuxRanDry) {
+        remuxRanDry = true;
+        qDebug() << "[bbtube][chunk] watchdog: player is stuck at" << posMs / 1000.0 << "s (state" << st
+                 << ") near the end of the file at" << remuxPlayableSeconds << "s; pending next file:"
+                 << (pendingSwapPath.isEmpty() ? "no" : "yes");
+    }
+    if (!pendingSwapPath.isEmpty()) {
+        swapToPendingFile();
+    } else {
         if (!remuxStallToastShown) {
             remuxStallToastShown = true;
-            UIUtils::toastInfo("Not downloaded yet...");
+            UIUtils::toastInfo("Buffering...");
         }
-    } else {
-        remuxSeekTargetMs = 0;
+        maybeRequestRemuxMerge();
     }
-    playerContext->seekTime(positionMs);
 }
 
 QString PlayerPage::remuxCacheDir()
@@ -1254,14 +1529,20 @@ void PlayerPage::onPlayerPositionChanged(unsigned int position)
     if (isLiveStream) {
         return;
     }
+    if (seekPending) {
+        return; // the old file is frozen; the slider shows the seek target
+    }
 
     if (!manualSeeking && !trackpadFocusInSlider) {
         progressSlider->setValue(position);
     }
 
+    if (position != lastPositionMs) {
+        lastPositionTickClock.start();
+    }
     lastPositionMs = position;
 
-    if (playingPartialRemux || pendingRemuxQualityLabel != "") {
+    if (remuxSession || retiringRemuxSession) {
         maybeRequestRemuxMerge();
     }
     // Normally the swap happens when the player reports the end of the file

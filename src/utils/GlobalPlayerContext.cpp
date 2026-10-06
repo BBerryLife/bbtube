@@ -20,7 +20,7 @@ GlobalPlayerContext::GlobalPlayerContext(QObject *parent) :
         QObject(parent), frameWidth(0), frameHeight(0), classic(false), audioOnly(false), screenWidth(
                 0), screenHeight(0), windowId(""), windowGroup(""), windowHandle(0), repeatMode(
                 bb::multimedia::RepeatMode::None), playlistId(0), updateViewedPercent(true), continuePlaying(
-                false), partialSource(false)
+                false), partialSource(false), positionOffsetMs(0), fullDurationMs(0), seekIntercept(false)
 {
     mediaPlayer = new bb::multimedia::MediaPlayer(this);
     mediaPlayer->setVideoOutput(bb::multimedia::VideoOutput::PrimaryDisplay);
@@ -98,7 +98,7 @@ void GlobalPlayerContext::onNpcRevoked()
 }
 void GlobalPlayerContext::onPlayerDurationChanged(unsigned int duration)
 {
-    npc->setDuration(duration);
+    npc->setDuration(fullDurationMs > 0 ? (unsigned int) fullDurationMs : duration);
 }
 void GlobalPlayerContext::setPrevEnabled(bool enabled)
 {
@@ -114,6 +114,8 @@ void GlobalPlayerContext::setNpcMetadata(QVariantMap metadata)
 }
 void GlobalPlayerContext::onPlayerPositionChanged(unsigned int position)
 {
+    position += positionOffsetMs; // file time -> video time
+
     npc->setPosition(position);
 
     emit positionChanged(position);
@@ -152,8 +154,8 @@ void GlobalPlayerContext::onMediaStateChanged(bb::multimedia::MediaState::Type s
         // watched / apply repeat-track behavior when we actually reached
         // the end, otherwise a mid-video pause or hiccup gets recorded as
         // "100% watched" and can trigger an unwanted repeat.
-        unsigned int position = mediaPlayer->position();
-        unsigned int duration = mediaPlayer->duration();
+        unsigned int position = getPosition();
+        unsigned int duration = getDuration();
         // A partial remux file also "ends" -- but that is only the end of
         // what has been downloaded so far. Treating it as the end of the
         // video would mark it 100% watched in the DB and, with
@@ -184,11 +186,11 @@ bb::multimedia::MediaState::Type GlobalPlayerContext::getMediaState()
 }
 int GlobalPlayerContext::getPosition()
 {
-    return mediaPlayer->position();
+    return (int) mediaPlayer->position() + positionOffsetMs;
 }
 int GlobalPlayerContext::getDuration()
 {
-    return mediaPlayer->duration();
+    return fullDurationMs > 0 ? fullDurationMs : (int) mediaPlayer->duration();
 }
 bb::multimedia::MediaError::Type GlobalPlayerContext::play()
 {
@@ -200,7 +202,11 @@ void GlobalPlayerContext::setPartialSource(bool partial)
 }
 bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 {
-    partialSource = false; // the caller flags a partial remux file afterwards
+    // The caller describes a remuxed window of the video afterwards.
+    partialSource = false;
+    positionOffsetMs = 0;
+    fullDurationMs = 0;
+    seekIntercept = false;
     // Local filesystem paths (e.g. from the remux cache) have no scheme,
     // so QUrl(url) parses them with an empty scheme() -- mmrenderer then
     // can't identify the input type (it tries "playlist"/"autolist"
@@ -243,7 +249,10 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url,
     // (a keyframe boundary -- see ChunkedRemuxSession::keyframeResumeSeconds).
     // Seeking to an arbitrary position instead can make the player resume at
     // the previous keyframe, i.e. rewind by up to a whole GOP.
-    int target = seekMs >= 0 ? seekMs : currPosition;
+    // seekMs is VIDEO time; the new file starts positionOffsetMs into it
+    // (setTimeline() has already been called for it).
+    int target = seekMs >= 0 ? seekMs - positionOffsetMs : currPosition;
+    if (target < 0) target = 0;
     if (!audioOnly) {
         mediaPlayer->seekTime(target);
     }
@@ -271,27 +280,48 @@ void GlobalPlayerContext::acquire()
 }
 void GlobalPlayerContext::seekTime(unsigned int position)
 {
-    mediaPlayer->seekTime(position);
+    if (seekIntercept) {
+        emit seekRequested(position);
+        return;
+    }
+    seekTimeDirect(position);
+}
+void GlobalPlayerContext::seekTimeDirect(unsigned int position)
+{
+    int rel = (int) position - positionOffsetMs;
+    mediaPlayer->seekTime(rel > 0 ? (unsigned int) rel : 0);
+}
+void GlobalPlayerContext::setTimeline(int offsetMs, int fullDuration)
+{
+    positionOffsetMs = offsetMs;
+    fullDurationMs = fullDuration;
+    if (fullDurationMs > 0) {
+        npc->setDuration((unsigned int) fullDurationMs);
+    }
+}
+void GlobalPlayerContext::setSeekIntercept(bool intercept)
+{
+    seekIntercept = intercept;
 }
 void GlobalPlayerContext::skipXSecondsForward(unsigned int seconds)
 {
-    unsigned int videoDuration = mediaPlayer->duration();
-    unsigned int videoPosition = mediaPlayer->position();
+    unsigned int videoDuration = getDuration();
+    unsigned int videoPosition = getPosition();
 
     if (videoPosition + seconds * 1000 < videoDuration) {
-        mediaPlayer->seekTime(videoPosition + seconds * 1000);
+        seekTime(videoPosition + seconds * 1000);
     } else {
-        mediaPlayer->seekTime(videoDuration - 1);
+        seekTime(videoDuration - 1);
     }
 }
 void GlobalPlayerContext::skipXSecondsBackward(unsigned int seconds)
 {
-    int videoPosition = mediaPlayer->position();
+    int videoPosition = getPosition();
 
     if (videoPosition - (int)seconds * 1000 > 0) {
-        mediaPlayer->seekTime(videoPosition - (int)seconds * 1000);
+        seekTime(videoPosition - (int)seconds * 1000);
     } else {
-        mediaPlayer->seekTime(0);
+        seekTime(0);
     }
 }
 
@@ -716,8 +746,7 @@ void GlobalPlayerContext::setViewedPercent()
     }
 
     int viewedPercent =
-            mediaPlayer->duration() > 0 ?
-                    10000 * (long long) mediaPlayer->position() / mediaPlayer->duration() : 0;
+            getDuration() > 0 ? 10000 * (long long) getPosition() / getDuration() : 0;
     DbHelper::setViewedPercent(this->videoMetadata.video.videoId, viewedPercent);
     VideoViewedPercentProxy::getInstance()->setViewedPercent(this->videoMetadata.video.videoId,
             viewedPercent);
