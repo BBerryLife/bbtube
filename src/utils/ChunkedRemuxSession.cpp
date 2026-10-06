@@ -59,7 +59,7 @@ struct RunPart
 // Groups samples [i0,i1) into contiguous source runs and splits big runs
 // into parallel parts. Returns the total payload size.
 static qint64 buildRunParts(const std::vector<FragSample> &s, size_t i0, size_t i1,
-        std::vector<RunPart> *out)
+        std::vector<RunPart> *out, int maxParts)
 {
     qint64 bufOff = 0;
     size_t i = i0;
@@ -74,7 +74,7 @@ static qint64 buildRunParts(const std::vector<FragSample> &s, size_t i0, size_t 
         if (runLen > 0) {
             int parts = int(runLen / MIN_PART_BYTES);
             if (parts < 1) parts = 1;
-            if (parts > MAX_PARTS) parts = MAX_PARTS;
+            if (parts > maxParts) parts = maxParts;
             qint64 base = runLen / parts;
             qint64 off = 0;
             for (int p = 0; p < parts; p++) {
@@ -403,7 +403,10 @@ void ChunkedRemuxSession::queueVideoBodyJobs(size_t k)
 {
     Chunk &c = m_chunks[k];
     std::vector<RunPart> parts;
-    qint64 bytes = buildRunParts(m_vAll, c.vi0, c.vi1, &parts);
+    // After a failed structure check, refetch as ONE request: every extra
+    // parallel request is another chance for the relay to answer with wrong
+    // bytes, so the speed-up that parallelism gives is not worth it here.
+    qint64 bytes = buildRunParts(m_vAll, c.vi0, c.vi1, &parts, c.verifyRetries > 0 ? 1 : MAX_PARTS);
     c.vBuf = QByteArray(int(bytes), 0);
     c.vPending = int(parts.size());
     for (size_t i = 0; i < parts.size(); i++) {
@@ -421,7 +424,7 @@ void ChunkedRemuxSession::queueAudioBodyJobs(size_t k)
 {
     Chunk &c = m_chunks[k];
     std::vector<RunPart> parts;
-    qint64 bytes = buildRunParts(m_aAll, c.ai0, c.ai1, &parts);
+    qint64 bytes = buildRunParts(m_aAll, c.ai0, c.ai1, &parts, MAX_PARTS);
     c.aBuf = QByteArray(int(bytes), 0);
     c.aPending = int(parts.size());
     for (size_t i = 0; i < parts.size(); i++) {
@@ -657,6 +660,15 @@ void ChunkedRemuxSession::appendReadyChunks()
         m_aStage->flush();
         m_vStageBytes += c.vBuf.size();
         m_aStageBytes += c.aBuf.size();
+        {
+            double startSec = double(m_vTicks) / double(m_videoHead.timescale);
+            int32_t cto = (c.vi1 > c.vi0) ? m_vAll[c.vi0].compositionOffset : 0;
+            if (cto < 0) cto = 0;
+            double resume = m_nextToAppend == 0 ?
+                    0.0 : startSec + double(cto) / double(m_videoHead.timescale) + 0.04;
+            m_boundaryStart.push_back(startSec);
+            m_boundaryResume.push_back(resume);
+        }
         for (size_t i = c.vi0; i < c.vi1; i++) {
             m_videoHead.fragSamples.push_back(m_vAll[i]);
             m_vTicks += m_vAll[i].duration;
@@ -688,6 +700,22 @@ void ChunkedRemuxSession::appendReadyChunks()
 // ---------------------------------------------------------------------------
 // Merging
 // ---------------------------------------------------------------------------
+double ChunkedRemuxSession::keyframeResumeSeconds(double nearSeconds) const
+{
+    if (m_boundaryStart.empty()) return nearSeconds;
+    size_t best = 0;
+    double bestDist = -1;
+    for (size_t i = 0; i < m_boundaryStart.size(); i++) {
+        double d = m_boundaryStart[i] - nearSeconds;
+        if (d < 0) d = -d;
+        if (bestDist < 0 || d < bestDist) {
+            bestDist = d;
+            best = i;
+        }
+    }
+    return m_boundaryResume[best];
+}
+
 void ChunkedRemuxSession::requestMerge()
 {
     if (m_cancelled || !m_vStage || !m_aStage) return;
@@ -734,6 +762,7 @@ void ChunkedRemuxSession::requestMerge()
         return;
     }
     m_mergeActive = true;
+    m_mergeClock.start();
     QTimer::singleShot(0, this, SLOT(onMergeStep()));
 }
 
@@ -780,7 +809,9 @@ void ChunkedRemuxSession::finishMerge()
     m_mergeActive = false;
     m_mergedChunksDone = m_mergeChunks;
     qDebug() << "[bbtube][chunk] merged file" << m_mergePath << "ready at" << m_clock.elapsed()
-             << "ms, covers" << m_mergeCovered << "s" << (m_mergeFinal ? "(FINAL)" : "");
+             << "ms, covers" << m_mergeCovered << "s" << (m_mergeFinal ? "(FINAL)" : "")
+             << "- copy took" << m_mergeClock.elapsed() << "ms for"
+             << (m_vStageBytes + m_aStageBytes) / 1024 << "KB";
 
     // Merged files from two merges ago are no longer needed: the player has
     // long since swapped away from them. The final copy is the cache entry.

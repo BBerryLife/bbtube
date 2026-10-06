@@ -1,5 +1,6 @@
 #include "StorageParser.hpp"
 #include "src/parser/models/StorageData.hpp"
+#include "src/utils/AudioTrackPicker.hpp"
 
 #include <bb/data/JsonDataAccess>
 #include <QUrl>
@@ -109,6 +110,9 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
     QVariantList adaptiveFormats = streamingData["adaptiveFormats"].toList();
 
     bool haveAudio = false;
+    bool bestAudioIsMp4 = false;
+    int bestAudioScore = -1; // audioOriginalScore(): 2 original, 1 unmarked, 0 dub
+    unsigned long long bestAudioBitrate = 0;
 
     for (int i = 0; i < adaptiveFormats.count(); i++) {
         QVariantMap format = adaptiveFormats[i].toMap();
@@ -122,8 +126,28 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
             // fall back to whatever is available if no mp4 audio exists.
             bool isMp4Audio = mimeType.contains("audio/mp4");
 
-            if (haveAudio && !isMp4Audio) {
-                continue; // keep first/best match
+            // Ranking: mp4 over anything else (the remuxer needs ISOBMFF),
+            // then the ORIGINAL language over auto-dubs (see
+            // AudioTrackPicker.hpp), then bitrate. The old code kept
+            // whichever mp4 track came last, i.e. an arbitrary language.
+            // signatureCipher/cipher carry the url (and its xtags) inside.
+            QString haystack = format["url"].toString() + "&" + format["signatureCipher"].toString()
+                    + "&" + format["cipher"].toString();
+            int score = audioOriginalScore(haystack, format);
+            unsigned long long bitrate = format["bitrate"].toString().toULongLong();
+
+            bool shouldReplace;
+            if (!haveAudio) {
+                shouldReplace = true;
+            } else if (isMp4Audio != bestAudioIsMp4) {
+                shouldReplace = isMp4Audio;
+            } else if (score != bestAudioScore) {
+                shouldReplace = score > bestAudioScore;
+            } else {
+                shouldReplace = bitrate >= bestAudioBitrate;
+            }
+            if (!shouldReplace) {
+                continue;
             }
 
             AudioStorageData audio;
@@ -140,8 +164,10 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
 
             if (!audio.url.isEmpty() || !audio.cipher.isEmpty()) {
                 storageData->audio = audio;
-                haveAudio = isMp4Audio || haveAudio;
-                if (!haveAudio) haveAudio = true;
+                haveAudio = true;
+                bestAudioIsMp4 = isMp4Audio;
+                bestAudioScore = score;
+                bestAudioBitrate = bitrate;
             }
         } else if (isVideo) {
             // NOTE: this used to be gated behind "storageData->instances.isEmpty()",

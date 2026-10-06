@@ -1,5 +1,6 @@
 #include "InvidiousClient.hpp"
 #include "src/applicationui.hpp"
+#include "src/utils/AudioTrackPicker.hpp"
 
 #include <bb/data/JsonDataAccess>
 
@@ -413,7 +414,11 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
     QString bestAudioUrl;
     unsigned long long bestAudioBitrate = 0;
     bool bestAudioIsMp4 = false;
+    int bestAudioScore = -1; // see audioOriginalScore(): 2 original, 1 unmarked, 0 dub
+    QString bestAudioLabel;
     int audioCandidatesSeen = 0;
+    int originalAudioSeen = 0;
+    int dubbedAudioSeen = 0;
 
     for (int i = 0; i < adaptiveFormats.count(); i++) {
         QVariantMap fmt = adaptiveFormats[i].toMap();
@@ -427,28 +432,47 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
         }
         audioCandidatesSeen++;
 
-        // mp4_stream_remux (see StreamingRemuxSession) only understands
-        // ISOBMFF/MP4 box structure -- an audio/webm (Opus) track is a
-        // completely different container (EBML) and will never contain
-        // an "ftyp" box no matter how much of it is fetched. Prefer
-        // audio/mp4 unconditionally; only fall back to a non-mp4 track
-        // if no mp4 audio exists at all (matching StorageParser's
-        // InnerTube-path behavior, which does the same for the same
-        // reason).
-        bool isMp4Audio = type.contains("audio/mp4");
-        if (!bestAudioUrl.isEmpty() && bestAudioIsMp4 && !isMp4Audio) {
-            continue; // already have a usable mp4 track -- don't replace it with webm
-        }
+        int score = audioOriginalScore(url, fmt);
+        if (score == 2) originalAudioSeen++;
+        if (score == 0) dubbedAudioSeen++;
 
+        // Ranking, strongest first:
+        //  1. container: mp4_stream_remux only understands ISOBMFF/MP4 --
+        //     an audio/webm (Opus) track is a different container (EBML)
+        //     and will never contain an "ftyp" box, so any mp4 track beats
+        //     any webm one (webm only if no mp4 audio exists at all,
+        //     matching StorageParser's InnerTube path).
+        //  2. language: the original track beats unmarked, which beats
+        //     dubs (YouTube auto-dubs popular videos into dozens of
+        //     languages; choosing by bitrate alone picked e.g. a Portuguese
+        //     dub of an English video).
+        //  3. bitrate.
+        bool isMp4Audio = type.contains("audio/mp4");
         unsigned long long bitrate = fmt["bitrate"].toString().toULongLong();
-        bool shouldReplace = bestAudioUrl.isEmpty()
-                || (isMp4Audio && !bestAudioIsMp4) // upgrade non-mp4 -> mp4 regardless of bitrate
-                || (isMp4Audio == bestAudioIsMp4 && bitrate >= bestAudioBitrate);
+
+        bool shouldReplace;
+        if (bestAudioUrl.isEmpty()) {
+            shouldReplace = true;
+        } else if (isMp4Audio != bestAudioIsMp4) {
+            shouldReplace = isMp4Audio;
+        } else if (score != bestAudioScore) {
+            shouldReplace = score > bestAudioScore;
+        } else {
+            shouldReplace = bitrate >= bestAudioBitrate;
+        }
         if (shouldReplace) {
             bestAudioBitrate = bitrate;
             bestAudioUrl = url;
             bestAudioIsMp4 = isMp4Audio;
+            bestAudioScore = score;
+            bestAudioLabel = audioTrackDebugLabel(url, fmt);
         }
+    }
+    qDebug() << "[bbtube][invidious] audio pick:" << bestAudioLabel << ", score" << bestAudioScore
+             << "(2=original 1=unmarked 0=dub) ; candidates:" << audioCandidatesSeen
+             << ", marked original:" << originalAudioSeen << ", marked dub/other:" << dubbedAudioSeen;
+    if (bestAudioScore == 0 && originalAudioSeen == 0) {
+        qDebug() << "[bbtube][invidious] WARNING: every mp4 audio track is a dub; the original may only exist as webm";
     }
 
     if (!bestAudioUrl.isEmpty()) {

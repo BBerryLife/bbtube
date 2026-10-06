@@ -65,6 +65,19 @@ public:
     bool isMerging() const { return m_mergeActive; }
     bool hasFailed() const { return m_failed; }
 
+    // Where a player that must continue playback in a (longer) merged file
+    // should seek so it lands exactly on a keyframe.
+    //
+    // Chunk boundaries are keyframes, and the only positions a seek can hit
+    // exactly: a seek into the middle of a GOP resumes at the previous
+    // keyframe, a rewind of up to a GOP (6-8s on YouTube). Returns the
+    // position, in seconds, of the chunk boundary closest to nearSeconds
+    // (among the chunks downloaded so far), already nudged past that
+    // keyframe's composition-time offset (its PTS is DTS + a few frame
+    // durations whenever the stream has B-frames) so a PTS-based seek cannot
+    // fall short of it.
+    double keyframeResumeSeconds(double nearSeconds) const;
+
 signals:
     // Fires every time another chunk has been appended to the staging files.
     void progress(double downloadedSeconds, double totalSeconds);
@@ -176,6 +189,10 @@ private:
     QFile *m_vStage, *m_aStage;
     qint64 m_vStageBytes, m_aStageBytes;
     uint64_t m_vTicks, m_aTicks;
+    // One entry per downloaded chunk: its first keyframe's start time and
+    // the position to seek to in order to land on it.
+    std::vector<double> m_boundaryStart, m_boundaryResume;
+    QTime m_mergeClock;
     double m_coveredSeconds, m_totalSeconds;
 
     // --- merge ---

@@ -222,6 +222,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/settings/AppSettings.hpp) \
         $$quote($$BASEDIR/src/settings/SettingsSheet.hpp) \
         $$quote($$BASEDIR/src/utils/ActionItemService.hpp) \
+        $$quote($$BASEDIR/src/utils/AudioTrackPicker.hpp) \
         $$quote($$BASEDIR/src/utils/BasePage.hpp) \
         $$quote($$BASEDIR/src/utils/BaseSheet.hpp) \
         $$quote($$BASEDIR/src/utils/BaseTab.hpp) \

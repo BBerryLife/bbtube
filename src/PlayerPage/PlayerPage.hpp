@@ -12,6 +12,8 @@
 #include "src/models/PlaylistListItemModel.hpp"
 #include "src/utils/CustomListView.hpp"
 #include "src/utils/ChunkedRemuxSession.hpp"
+#include <QPointer>
+#include <QTime>
 
 #include <bb/cascades/Container>
 #include <bb/cascades/Slider>
@@ -157,6 +159,20 @@ private:
     // Position the person seeked to that is not downloaded yet (ms), 0 if none.
     unsigned int remuxSeekTargetMs;
     bool remuxStallToastShown;
+    // A longer merged file that is ready but not swapped in yet. Swapping
+    // reloads the source, so it is done exactly when the player has played
+    // the current file to its end: the new file then resumes on the keyframe
+    // at that very boundary and nothing is repeated or skipped.
+    QString pendingSwapPath;
+    double pendingSwapCovered;
+    bool pendingSwapFinal;
+    QPointer<ChunkedRemuxSession> pendingSwapSession;
+    bool remuxRanDry; // player reached the end of the partial file
+    bool remuxSwapping; // inside swapToPendingFile(): ignore the state changes it causes
+    unsigned int lastPositionMs; // last position tick (the player's own value is unreliable at EOF)
+    double remuxLastMergeSeconds; // how long the last merge took, to start the next one early enough
+    bool remuxMergeTimed;
+    QTime remuxMergeClock;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
     void playVideo();
@@ -165,13 +181,16 @@ private:
     void hideInfos();
     void showInfos();
     void setAudioOnly(bool audioOnly);
-    void changeQuality(QString newQuality, QString url, bool forcePlay = false);
+    void changeQuality(QString newQuality, QString url, bool forcePlay = false, int seekMs = -1);
     void startPlaybackAt(QString url);
     void playVideoWithRemux(SingleVideoStorageData videoData);
     void changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData);
     void startRemuxSession(SingleVideoStorageData videoData);
     void clearRemuxSessions(); // cancels+deletes remuxSession and retiringRemuxSession, if present
     void maybeRequestRemuxMerge();
+    void queuePendingSwap(ChunkedRemuxSession *session, QString path, double covered, bool isFinal);
+    void swapToPendingFile();
+    void markMergeRequested();
     void seekWithinPlayable(unsigned int positionMs);
     QString remuxCacheDir();
     QString remuxBaseNameFor(QString videoId, QString quality);

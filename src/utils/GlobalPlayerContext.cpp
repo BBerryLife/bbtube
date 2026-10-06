@@ -20,7 +20,7 @@ GlobalPlayerContext::GlobalPlayerContext(QObject *parent) :
         QObject(parent), frameWidth(0), frameHeight(0), classic(false), audioOnly(false), screenWidth(
                 0), screenHeight(0), windowId(""), windowGroup(""), windowHandle(0), repeatMode(
                 bb::multimedia::RepeatMode::None), playlistId(0), updateViewedPercent(true), continuePlaying(
-                false)
+                false), partialSource(false)
 {
     mediaPlayer = new bb::multimedia::MediaPlayer(this);
     mediaPlayer->setVideoOutput(bb::multimedia::VideoOutput::PrimaryDisplay);
@@ -154,7 +154,11 @@ void GlobalPlayerContext::onMediaStateChanged(bb::multimedia::MediaState::Type s
         // "100% watched" and can trigger an unwanted repeat.
         unsigned int position = mediaPlayer->position();
         unsigned int duration = mediaPlayer->duration();
-        bool reachedEnd = duration > 0 && position >= duration - 1500;
+        // A partial remux file also "ends" -- but that is only the end of
+        // what has been downloaded so far. Treating it as the end of the
+        // video would mark it 100% watched in the DB and, with
+        // repeat-track on, restart the partial file from 0:00.
+        bool reachedEnd = !partialSource && duration > 0 && position >= duration - 1500;
 
         if (reachedEnd) {
             if (updateViewedPercent) {
@@ -190,8 +194,13 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::play()
 {
     return mediaPlayer->play();
 }
+void GlobalPlayerContext::setPartialSource(bool partial)
+{
+    partialSource = partial;
+}
 bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 {
+    partialSource = false; // the caller flags a partial remux file afterwards
     // Local filesystem paths (e.g. from the remux cache) have no scheme,
     // so QUrl(url) parses them with an empty scheme() -- mmrenderer then
     // can't identify the input type (it tries "playlist"/"autolist"
@@ -217,7 +226,8 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 
     return error;
 }
-bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url, bool forcePlay)
+bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url, bool forcePlay,
+        int seekMs)
 {
     int currPosition = mediaPlayer->position();
     bb::multimedia::MediaState::Type currState = mediaPlayer->mediaState();
@@ -229,8 +239,13 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url,
     mediaPlayer->setSourceUrl(mediaUrl);
     mediaPlayer->prepare();
 
+    // seekMs >= 0: the caller knows exactly where the new file must resume
+    // (a keyframe boundary -- see ChunkedRemuxSession::keyframeResumeSeconds).
+    // Seeking to an arbitrary position instead can make the player resume at
+    // the previous keyframe, i.e. rewind by up to a whole GOP.
+    int target = seekMs >= 0 ? seekMs : currPosition;
     if (!audioOnly) {
-        mediaPlayer->seekTime(currPosition);
+        mediaPlayer->seekTime(target);
     }
     // forcePlay: resume even though the old (partial) file had already run
     // out of data and the player sat in Stopped.

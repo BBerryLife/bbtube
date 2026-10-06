@@ -54,6 +54,9 @@ private:
     bool audioOnly;
     bool updateViewedPercent;
     bool continuePlaying;
+    // The loaded file is a partial, still-growing remux: its end is NOT the
+    // end of the video (see PlayerPage / ChunkedRemuxSession).
+    bool partialSource;
     VideoMetadata videoMetadata;
     StorageData storageData;
     SingleVideoStorageData selectedStorageData;
@@ -88,7 +91,9 @@ public:
     int getDuration();
     bb::multimedia::MediaError::Type play();
     bb::multimedia::MediaError::Type play(QString url);
-    bb::multimedia::MediaError::Type changeQuality(QString url, bool forcePlay = false);
+    bb::multimedia::MediaError::Type changeQuality(QString url, bool forcePlay = false,
+            int seekMs = -1);
+    void setPartialSource(bool partial);
     bb::multimedia::MediaError::Type setEqualizerPreset(
             bb::multimedia::EqualizerPreset::Type preset);
     void setMetadata(VideoMetadata videoMetadata, StorageData storageData, bool audioOnly);
