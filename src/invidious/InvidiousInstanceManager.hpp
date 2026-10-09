@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QMap>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QSslError>
 
@@ -80,6 +81,10 @@ public:
     // call the app happens to make.
     QString pickRandomInstance() const;
 
+    // An instance whose media proxy failed is skipped by pickRandomInstance()
+    // for a while (it is still used if every known instance is marked bad).
+    void markBad(const QString &instanceBaseUrl, int minutes = 10);
+
     // Returns true once at least one successful refresh has completed
     // (i.e. pickRandomInstance() is drawing from the live notPipe.json
     // list rather than the hardcoded fallback).
@@ -100,6 +105,7 @@ private slots:
     void onFetchTimeout();
 
 private:
+    mutable QMap<QString, qint64> badUntilMs; // instance base url -> epoch ms
     QStringList liveInstances;  // populated from notPipe.json's "invidious" list; empty until first successful refresh
     bool refreshInFlight;
     // Tracks the in-flight instances.json request so onFetchTimeout() can

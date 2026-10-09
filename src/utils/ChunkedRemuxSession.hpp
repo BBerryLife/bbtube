@@ -58,6 +58,22 @@ public:
     // already stored the head moves on to the first missing chunk after it.
     int seekTo(double absSeconds);
 
+    // Tells the session where playback currently is (video time). Downloading
+    // then stays at most ~5 minutes ahead of it and runs with fewer parallel
+    // requests while the next data is not needed soon: the player and the
+    // downloader share one weak CPU, and a downloader running flat out was
+    // starving the player into stopping.
+    void setPlayhead(double absSeconds);
+
+    // A source that failed for good (every retry used up, or corrupt data)
+    // pauses the session and emits sourceFailing(). The owner then either
+    // supplies urls of the SAME streams from elsewhere (replaceSources) --
+    // everything already downloaded is kept and downloading continues -- or
+    // gives up.
+    void replaceSources(const QString &videoUrl, const QString &audioUrl);
+    void giveUp(const QString &reason);
+    bool isWaitingForSource() const { return m_sourcePaused; }
+
     // Builds a merged file for the run of stored chunks that begins at
     // startChunk (which must be stored). Async; result via mergedReady().
     void requestMerge(int startChunk);
@@ -93,6 +109,8 @@ signals:
     // whole video from 0:00 (it is also the cached copy for next time).
     void mergedReady(QString path, int startChunk, int chunkCount, bool isFinal);
     void failed(QString message);
+    // Downloading stopped because the current urls do not work (see above).
+    void sourceFailing(QString reason);
 
 private slots:
     void onHeadFinished();
@@ -118,8 +136,9 @@ private:
         QNetworkReply *reply;
         QTime startedAt;
         QTime lastActivity;
+        qint64 retryAt; // m_clock ms at which a failed request may be re-queued
         Job *twin; // hedged duplicate of the same request (first to finish wins)
-        Job() : type(0), chunk(0), frag(0), start(0), len(0), bufOffset(0), retries(0), reply(0), twin(0) {}
+        Job() : type(0), chunk(0), frag(0), start(0), len(0), bufOffset(0), retries(0), reply(0), retryAt(0), twin(0) {}
     };
 
     struct Chunk
@@ -167,6 +186,10 @@ private:
     void storeChunk(size_t k);
     void startNextMerge();
     void failWith(const QString &message);
+    void pauseForNewSource(const QString &reason);
+    void resumeAfterSourceReplaced();
+    bool sameLayout(const TrackHead &a, const TrackHead &b) const;
+    int currentMaxInflight() const;
     void teardown(bool removeStageFiles);
     void finishMerge();
     void closeMergeFiles(bool removePartial);
@@ -196,6 +219,9 @@ private:
     std::vector<uint64_t> m_vFragOffset, m_aFragOffset; // absolute moof offsets in the sources
     std::vector<int> m_vFragState, m_aFragState; // 0 none, 1 in flight/queued, 2 done
     std::vector<std::vector<FragSample> > m_vFragSamples, m_aFragSamples; // kept: shared between chunks
+    bool m_sourcePaused;
+    double m_playheadSec; // <0: unknown
+    bool m_aheadLimited; // pump() declined to start chunks because they are too far ahead of the playhead
     int m_head; // chunk the download is currently working towards
     double m_pendingSeekSec; // seekTo() called before the plan existed (<0: none)
     int m_storedCount;
@@ -206,6 +232,7 @@ private:
     QMap<QNetworkReply *, Job *> m_inflight;
     QList<Job *> m_retryQueue;
     QTimer *m_watchdog;
+    QTimer *m_retryTimer;
 
     // --- staging: payloads of stored chunks, appended in completion order ---
     QFile *m_vStage, *m_aStage;

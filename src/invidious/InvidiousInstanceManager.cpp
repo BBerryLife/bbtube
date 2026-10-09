@@ -9,6 +9,7 @@
 #include <QVariantMap>
 #include <QTime>
 #include <QDebug>
+#include <QDateTime>
 #include <QtNetwork/QSslCertificate>
 #include <QTimer>
 
@@ -164,16 +165,40 @@ QStringList InvidiousInstanceManager::parseInstancesJson(const QString &json)
     return result;
 }
 
+void InvidiousInstanceManager::markBad(const QString &instanceBaseUrl, int minutes)
+{
+    if (instanceBaseUrl.isEmpty()) return;
+    QString key = instanceBaseUrl;
+    while (key.endsWith('/')) key.chop(1);
+    badUntilMs[key] = QDateTime::currentMSecsSinceEpoch() + qint64(minutes) * 60 * 1000;
+    qDebug() << "[bbtube][invidious] marking instance as bad for" << minutes << "min:" << key;
+}
+
 QString InvidiousInstanceManager::pickRandomInstance() const
 {
+    QStringList all;
     if (!liveInstances.isEmpty()) {
-        int index = qrand() % liveInstances.count();
-        return liveInstances[index];
+        all = liveInstances;
+    } else {
+        for (int i = 0; i < FALLBACK_INSTANCES_COUNT; i++) {
+            all << QString(FALLBACK_INSTANCES[i]);
+        }
     }
-
-    if (FALLBACK_INSTANCES_COUNT == 0) {
+    if (all.isEmpty()) {
         return "";
     }
-    int index = qrand() % FALLBACK_INSTANCES_COUNT;
-    return QString(FALLBACK_INSTANCES[index]);
+
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QStringList good;
+    for (int i = 0; i < all.size(); i++) {
+        QString key = all[i];
+        while (key.endsWith('/')) key.chop(1);
+        QMap<QString, qint64>::iterator it = badUntilMs.find(key);
+        if (it != badUntilMs.end() && it.value() > now) continue;
+        good << all[i];
+    }
+    if (good.isEmpty()) {
+        good = all; // everything is marked bad: better a bad instance than none
+    }
+    return good[qrand() % good.count()];
 }

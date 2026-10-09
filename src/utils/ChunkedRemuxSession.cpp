@@ -36,6 +36,13 @@ static const qint64 MIN_PART_BYTES = 96 * 1024;
 // (their buffers live in RAM: ~1MB per 5s of 720p).
 static const size_t CHUNK_WINDOW = 3;
 static const int MAX_RETRIES = 5;
+// Retry delays grow 0.4s, 0.8s, 1.6s, 3.2s, 5s: a relay answering 5xx to
+// everything used to be hammered ~3 times a second by up to 8 requests, which
+// on this CPU was enough to starve the player.
+static const int RETRY_MAX_DELAY_MS = 5000;
+static const double AHEAD_LIMIT_SECONDS = 300.0; // never download further ahead of the playhead than this
+static const double NEAR_SECONDS = 20.0; // closer than this to the playhead: full parallelism
+static const int MAX_INFLIGHT_RELAXED = 3;
 // Refetches of a whole chunk whose bytes failed the structure check. Each
 // attempt re-downloads ~0.5MB, cheap next to losing the whole playback to
 // an unlucky streak on a flaky relay.
@@ -94,6 +101,7 @@ static qint64 buildRunParts(const std::vector<FragSample> &s, size_t i0, size_t 
 
 static const int STALL_MS = 6000; // a request that has received nothing for this long is aborted and retried
 static const int HEDGE_MS = 4000; // the chunk the player needs next: duplicate requests older than this
+static const int HEDGE_IDLE_MS = 2500; // ...and has received nothing for this long
 static const int WATCHDOG_MS = 1000;
 static const int HEAD_TIMEOUT_MS = 8000;
 static const int MAX_HEDGE_EXTRA = 3; // hedged duplicates may exceed MAX_INFLIGHT by this many
@@ -106,14 +114,16 @@ ChunkedRemuxSession::ChunkedRemuxSession(QNetworkAccessManager *networkManager,
                 startAtSeconds), m_started(false), m_cancelled(false), m_failed(false), m_headsDone(
                 false), m_videoHeadOk(false), m_audioHeadOk(false), m_videoHeadSize(
                 INITIAL_HEAD_FETCH_BYTES), m_audioHeadSize(INITIAL_HEAD_FETCH_BYTES), m_videoHeadRetries(
-                0), m_audioHeadRetries(0), m_videoHeadReply(0), m_audioHeadReply(0), m_head(0), m_pendingSeekSec(
-                -1.0), m_storedCount(0), m_totalSeconds(0), m_watchdog(0), m_vStage(0), m_aStage(0), m_vStageBytes(0), m_aStageBytes(
+                0), m_audioHeadRetries(0), m_videoHeadReply(0), m_audioHeadReply(0), m_sourcePaused(false), m_playheadSec(-1.0), m_aheadLimited(false), m_head(0), m_pendingSeekSec(
+                -1.0), m_storedCount(0), m_totalSeconds(0), m_watchdog(0), m_retryTimer(0), m_vStage(0), m_aStage(0), m_vStageBytes(0), m_aStageBytes(
                 0), m_mergeActive(false), m_mergeNextStart(-1), m_mergeSeq(0), m_mergeStart(0), m_mergeCount(
                 0), m_mergeFinal(false), m_mergeOut(0), m_mergeAin(0), m_mergeVin(0), m_mergeASegIdx(
                 0), m_mergeVSegIdx(0), m_mergeSegLeft(0), m_mergeSegOpen(false)
 {
     m_watchdog = new QTimer(this);
     QObject::connect(m_watchdog, SIGNAL(timeout()), this, SLOT(onWatchdog()));
+    m_retryTimer = new QTimer(this);
+    QObject::connect(m_retryTimer, SIGNAL(timeout()), this, SLOT(onRetryTimer()));
 }
 
 ChunkedRemuxSession::~ChunkedRemuxSession()
@@ -210,7 +220,7 @@ void ChunkedRemuxSession::onHeadFinished()
             requestHead(isVideo);
             return;
         }
-        failWith(QString("%1 head fetch failed: %2").arg(label).arg(msg));
+        pauseForNewSource(QString("%1 head fetch failed: %2").arg(label).arg(msg));
         return;
     }
 
@@ -245,6 +255,19 @@ void ChunkedRemuxSession::onHeadFinished()
         return;
     }
 
+    if (m_headsDone) {
+        // Head of a REPLACEMENT source: it must describe exactly the same
+        // fragments as the stream the stored chunks came from.
+        if (!sameLayout(isVideo ? m_videoHead : m_audioHead, head)) {
+            pauseForNewSource(QString("replacement %1 stream has a different layout").arg(label));
+            return;
+        }
+        if (isVideo) m_videoHeadOk = true; else m_audioHeadOk = true;
+        if (m_videoHeadOk && m_audioHeadOk) {
+            resumeAfterSourceReplaced();
+        }
+        return;
+    }
     if (isVideo) {
         m_videoHead = head;
         m_videoHeadOk = true;
@@ -255,6 +278,18 @@ void ChunkedRemuxSession::onHeadFinished()
     if (m_videoHeadOk && m_audioHeadOk) {
         onHeadsReady();
     }
+}
+
+bool ChunkedRemuxSession::sameLayout(const TrackHead &a, const TrackHead &b) const
+{
+    if (a.sidx.entries.size() != b.sidx.entries.size()) return false;
+    if (a.sidx.firstFragmentOffset != b.sidx.firstFragmentOffset) return false;
+    if (a.timescale != b.timescale) return false;
+    for (size_t i = 0; i < a.sidx.entries.size(); i++) {
+        if (a.sidx.entries[i].referencedSize != b.sidx.entries[i].referencedSize) return false;
+        if (a.sidx.entries[i].subsegmentDuration != b.sidx.entries[i].subsegmentDuration) return false;
+    }
+    return true;
 }
 
 void ChunkedRemuxSession::onHeadsReady()
@@ -429,6 +464,10 @@ int ChunkedRemuxSession::seekTo(double absSeconds)
         return -1;
     }
     int k = chunkIndexAt(absSeconds);
+    // Playback will continue from the target, not from where the old file was
+    // frozen: without this the "never download further than N s ahead of the
+    // playhead" rule saw the target as hopelessly far ahead and skipped it.
+    m_playheadSec = absSeconds;
     int h = firstMissingFrom(k);
     if (h >= 0 && h != m_head) {
         bool alreadyWorking = (m_chunks[h].state == 1);
@@ -618,25 +657,49 @@ void ChunkedRemuxSession::queueBodyJobs(size_t k)
     }
 }
 
+int ChunkedRemuxSession::currentMaxInflight() const
+{
+    if (m_playheadSec < 0 || m_chunks.empty() || m_head < 0 || m_head >= int(m_chunks.size())) {
+        return MAX_INFLIGHT;
+    }
+    // The data being fetched is not needed for a while: no need to flood the
+    // device with parallel requests (it is also playing a video).
+    if (m_chunks[m_head].startSec - m_playheadSec > NEAR_SECONDS) return MAX_INFLIGHT_RELAXED;
+    return MAX_INFLIGHT;
+}
+
+void ChunkedRemuxSession::setPlayhead(double absSeconds)
+{
+    m_playheadSec = absSeconds;
+    if (m_aheadLimited && m_headsDone && !m_cancelled && !m_failed) {
+        pump(); // the playhead moved on: chunks that were too far ahead may be due now
+    }
+}
+
 void ChunkedRemuxSession::pump()
 {
-    if (m_cancelled || m_failed || !m_headsDone) return;
+    if (m_cancelled || m_failed || m_sourcePaused || !m_headsDone) return;
 
     int n = int(m_chunks.size());
     int working = 0;
     for (int k = 0; k < n; k++) if (m_chunks[k].state == 1) working++;
     // Start new chunks from the download head onward (wrapping round to fill
     // earlier gaps once everything after the head is stored).
+    m_aheadLimited = false;
     for (int i = 0; i < n && working < int(CHUNK_WINDOW); i++) {
         int kk = (m_head + i) % n;
-        if (m_chunks[kk].state == 0) {
-            scheduleDiscovery(size_t(kk));
-            working++;
+        if (m_chunks[kk].state != 0) continue;
+        if (m_playheadSec >= 0 && m_chunks[kk].startSec > m_playheadSec + AHEAD_LIMIT_SECONDS) {
+            m_aheadLimited = true; // far enough ahead already; resumes as the playhead advances
+            continue;
         }
+        scheduleDiscovery(size_t(kk));
+        working++;
     }
     tryAssemble();
 
-    while (m_inflight.size() < MAX_INFLIGHT && !m_queue.isEmpty()) {
+    int maxInflight = currentMaxInflight();
+    while (m_inflight.size() < maxInflight && !m_queue.isEmpty()) {
         // Nearest the head first, so the chunk the player needs next always
         // wins bandwidth over prefetching later ones.
         int best = 0;
@@ -750,24 +813,37 @@ void ChunkedRemuxSession::retryJob(Job *job, const QString &why)
     }
     if (job->retries < MAX_RETRIES) {
         job->retries++;
+        int delay = RETRY_DELAY_MS << (job->retries - 1);
+        if (delay > RETRY_MAX_DELAY_MS) delay = RETRY_MAX_DELAY_MS;
+        job->retryAt = m_clock.elapsed() + delay;
         qDebug() << "[bbtube][chunk] request type" << job->type << "chunk" << job->chunk
-                 << "failed (" << why << ") - retry" << job->retries << "of" << MAX_RETRIES;
+                 << "failed (" << why << ") - retry" << job->retries << "of" << MAX_RETRIES << "in" << delay << "ms";
         m_retryQueue.append(job);
-        QTimer::singleShot(RETRY_DELAY_MS, this, SLOT(onRetryTimer()));
+        if (!m_retryTimer->isActive()) m_retryTimer->start(250);
         return;
     }
     int type = job->type;
     int chunk = job->chunk;
     delete job;
-    failWith(QString("request (type %1, chunk %2) failed after %3 retries: %4").arg(type).arg(
+    pauseForNewSource(QString("request (type %1, chunk %2) failed after %3 retries: %4").arg(type).arg(
             chunk).arg(MAX_RETRIES).arg(why));
 }
 
 void ChunkedRemuxSession::onRetryTimer()
 {
-    if (m_cancelled || m_failed || m_retryQueue.isEmpty()) return;
-    Job *j = m_retryQueue.takeFirst();
-    m_queue.append(j);
+    if (m_cancelled || m_failed || m_sourcePaused) {
+        m_retryTimer->stop();
+        return;
+    }
+    qint64 now = m_clock.elapsed();
+    for (int i = 0; i < m_retryQueue.size();) {
+        if (m_retryQueue[i]->retryAt <= now) {
+            m_queue.append(m_retryQueue.takeAt(i));
+        } else {
+            i++;
+        }
+    }
+    if (m_retryQueue.isEmpty()) m_retryTimer->stop();
     pump();
 }
 
@@ -812,6 +888,10 @@ void ChunkedRemuxSession::onWatchdog()
         Job *j = m_inflight.value(replies[i], 0);
         if (!j || j->chunk != headChunk || j->twin) continue;
         if (j->startedAt.elapsed() < HEDGE_MS) continue;
+        // A request that is still receiving data is slow, not hung: a
+        // duplicate would only share the same relay bandwidth (and, in the
+        // field, doubled the load on the device for every single chunk).
+        if (j->lastActivity.elapsed() < HEDGE_IDLE_MS) continue;
         Job *t = new Job();
         t->type = j->type;
         t->chunk = j->chunk;
@@ -898,7 +978,7 @@ void ChunkedRemuxSession::onChunkBuffersComplete(size_t k)
             queueVideoBodyJobs(k);
             return;
         }
-        failWith(QString("chunk %1: video data is corrupt after %2 refetches").arg(qint64(k)).arg(
+        pauseForNewSource(QString("chunk %1: video data is corrupt after %2 refetches").arg(qint64(k)).arg(
                 MAX_VERIFY_RETRIES));
         return;
     }
@@ -923,7 +1003,7 @@ void ChunkedRemuxSession::onChunkBuffersComplete(size_t k)
             queueAudioBodyJobs(k);
             return;
         }
-        failWith(QString("chunk %1: audio data is corrupt after %2 refetches").arg(qint64(k)).arg(
+        pauseForNewSource(QString("chunk %1: audio data is corrupt after %2 refetches").arg(qint64(k)).arg(
                 MAX_VERIFY_RETRIES));
         return;
     }
@@ -1125,6 +1205,7 @@ void ChunkedRemuxSession::finishMerge()
 void ChunkedRemuxSession::teardown(bool removeStageFiles)
 {
     m_watchdog->stop();
+    m_retryTimer->stop();
     if (m_videoHeadReply) {
         QObject::disconnect(m_videoHeadReply, 0, this, 0);
         m_videoHeadReply->abort();
@@ -1170,6 +1251,60 @@ void ChunkedRemuxSession::cancel()
     if (m_cancelled) return;
     m_cancelled = true;
     teardown(true);
+}
+
+// Stops all network work (stored chunks stay) and asks the owner for other
+// urls of the same streams.
+void ChunkedRemuxSession::pauseForNewSource(const QString &reason)
+{
+    if (m_sourcePaused || m_failed || m_cancelled) return;
+    m_sourcePaused = true;
+    qDebug() << "[bbtube][chunk] source failing after" << m_clock.elapsed() << "ms:" << reason
+             << "- waiting for a replacement source";
+    m_retryTimer->stop();
+    if (m_videoHeadReply) {
+        QObject::disconnect(m_videoHeadReply, 0, this, 0);
+        m_videoHeadReply->abort();
+        m_videoHeadReply->deleteLater();
+        m_videoHeadReply = 0;
+    }
+    if (m_audioHeadReply) {
+        QObject::disconnect(m_audioHeadReply, 0, this, 0);
+        m_audioHeadReply->abort();
+        m_audioHeadReply->deleteLater();
+        m_audioHeadReply = 0;
+    }
+    if (m_headsDone) {
+        abortUnstoredWork(); // drops queued/in-flight requests and resets unfinished chunks
+    }
+    emit sourceFailing(reason);
+}
+
+void ChunkedRemuxSession::replaceSources(const QString &videoUrl, const QString &audioUrl)
+{
+    if (m_cancelled || m_failed) return;
+    qDebug() << "[bbtube][chunk] switching to a replacement source";
+    m_videoUrl = videoUrl;
+    m_audioUrl = audioUrl;
+    m_sourcePaused = false;
+    m_videoHeadOk = m_audioHeadOk = false;
+    m_videoHeadSize = m_audioHeadSize = INITIAL_HEAD_FETCH_BYTES;
+    m_videoHeadRetries = m_audioHeadRetries = 0;
+    // Heads are fetched again either way: the first time because nothing was
+    // known yet, otherwise to verify the new urls serve the same fragments.
+    requestHead(true);
+    requestHead(false);
+}
+
+void ChunkedRemuxSession::resumeAfterSourceReplaced()
+{
+    qDebug() << "[bbtube][chunk] replacement source verified, resuming download";
+    pump();
+}
+
+void ChunkedRemuxSession::giveUp(const QString &reason)
+{
+    failWith(reason);
 }
 
 void ChunkedRemuxSession::failWith(const QString &message)

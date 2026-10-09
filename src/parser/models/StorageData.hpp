@@ -44,6 +44,12 @@ public:
     QList<SingleVideoStorageData> instances;
     AudioStorageData audio;
     QList<ClosedCaptionData> captions;
+    // Invidious instance (scheme://host[:port], no trailing slash) that these
+    // stream urls were obtained from; empty for the direct YouTube path. Its
+    // /videoplayback proxy can fail even when its metadata api answered fine
+    // (seen in the field: HTTP 500 / 502 on every media request), in which
+    // case the player asks another instance for the same video.
+    QString sourceInstance;
 };
 
 #endif /* STORAGEDATA_HPP_ */

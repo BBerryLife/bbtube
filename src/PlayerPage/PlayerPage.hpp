@@ -37,6 +37,7 @@
 #include <bb/system/SystemUiResult>
 #include <bb/cascades/DoubleTapEvent>
 
+class InvidiousClient;
 class PlayerPage: public BasePage
 {
 Q_OBJECT
@@ -98,6 +99,9 @@ private slots:
     void onRemuxFailed(QString errorMessage);
     void onSeekRequested(unsigned int positionMs);
     void onRemuxWatchdog();
+    void onSourceFailing(QString reason);
+    void onAltSourceReceived(VideoMetadata videoMetadata, StorageData storageData);
+    void onAltSourceError(QString message);
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -196,6 +200,27 @@ private:
     unsigned int seekTargetMs;
     int seekChunk;
     bool seekResumePlay;
+    // Another Invidious instance for the same video, asked for when the one
+    // serving the media starts failing (see ChunkedRemuxSession::sourceFailing).
+    InvidiousClient *sourceClient;
+    int sourceAttempts;
+    QPointer<ChunkedRemuxSession> failoverSession;
+    QString remuxSessionQuality, retiringSessionQuality;
+    QString remuxSessionInstance, retiringSessionInstance;
+    // The merged file in the player (kept to reload it if the player stops unexpectedly).
+    QString loadedFilePath;
+    bool loadedFileFinal;
+    QTime lastLoadClock;
+    int recoveryCount;
+    QTime recoveryClock;
+    // Paused just before the end of a partial file (instead of letting it stop,
+    // which turns the picture black) until the next file is ready.
+    bool remuxBufferPaused;
+    bool staleStateLogged;
+    // The very first file (and the first file after a seek) waits for ~10s of
+    // video so that the player has time to spare while later chunks download.
+    bool firstFileWaitActive;
+    QTime firstFileWaitClock;
     bb::cascades::Container *seekLoadingOverlay;
     bb::cascades::ActivityIndicator *seekLoadingSpinner;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
@@ -220,6 +245,9 @@ private:
     void requestSeekMerge();
     void showSeekLoading(bool show);
     void maybeRequestFinalCopy();
+    bool enoughForFirstFile(int startChunk);
+    bool positionIsAdvancing();
+    void recoverPlayback(unsigned int positionMs);
     void swapToPendingFile();
     void markMergeRequested();
     void seekWithinPlayable(unsigned int positionMs);

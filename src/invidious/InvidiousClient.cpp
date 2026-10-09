@@ -339,6 +339,9 @@ QString InvidiousClient::resolveStreamUrl(const QString &url, const QUrl &instan
 void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &instanceUrl,
         StorageData *outStorageData)
 {
+    // Remember which instance these urls came from: its media proxy can fail
+    // even though its metadata api answered (see PlayerPage::onSourceFailing).
+    outStorageData->sourceInstance = instanceUrl.scheme() + "://" + instanceUrl.authority();
     bool liveNow = videoMap["liveNow"].toBool();
 
     if (liveNow) {
