@@ -437,6 +437,18 @@ public:
     {
         SingleVideoMetadata data;
 
+        // Lockups are not only videos: "Mix" / playlist / podcast cards use the
+        // same shape, but their contentId is a *playlist* id (e.g. "RD...").
+        // Treating that as a videoId produces a broken thumbnail
+        // (i.ytimg.com/vi/<playlistId>/...), no duration (shown as a red
+        // LIVE badge, since an empty length means live stream) and an item
+        // that can't be played. Return an empty videoId so callers skip it.
+        // An absent contentType is treated as a video to stay lenient.
+        QString contentType = lockupViewModel["contentType"].toString();
+        if (!contentType.isEmpty() && contentType != "LOCKUP_CONTENT_TYPE_VIDEO") {
+            return data;
+        }
+
         data.videoId = lockupViewModel["contentId"].toString();
 
         QVariantMap metadataViewModel =
