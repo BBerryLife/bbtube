@@ -79,7 +79,13 @@ public:
     // FALLBACK_INSTANCES in the .cpp) -- rather than returning "" -- so
     // video playback isn't blocked on this being the very first network
     // call the app happens to make.
-    QString pickRandomInstance() const;
+    // exclude: instances not to pick (e.g. the one that is currently being slow); ignored if nothing else is left.
+    // Instances whose measured download speed is known to be good are preferred, known-slow ones avoided.
+    QString pickRandomInstance(const QStringList &exclude = QStringList()) const;
+
+    // Download speed seen from an instance while playing a video, in seconds of media per second of wall
+    // time (1 = just keeps up with playback). Kept for this run of the app, smoothed.
+    void recordPerformance(const QString &instanceBaseUrl, double ratio);
 
     // An instance whose media proxy failed is skipped by pickRandomInstance()
     // for a while (it is still used if every known instance is marked bad).
@@ -106,6 +112,7 @@ private slots:
 
 private:
     mutable QMap<QString, qint64> badUntilMs; // instance base url -> epoch ms
+    QMap<QString, double> perfRatio; // instance base url -> smoothed download speed ratio
     QStringList liveInstances;  // populated from notPipe.json's "invidious" list; empty until first successful refresh
     bool refreshInFlight;
     // Tracks the in-flight instances.json request so onFetchTimeout() can

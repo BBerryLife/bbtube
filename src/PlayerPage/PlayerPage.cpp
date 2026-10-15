@@ -35,6 +35,8 @@
 #include <bb/cascades/StackLayout>
 #include <bb/cascades/StackLayoutProperties>
 #include <bb/cascades/LayoutOrientation>
+#include <bb/cascades/Image>
+#include <bb/ImageData>
 #include <bb/cascades/ForeignWindowControl>
 #include <bb/cascades/TouchEvent>
 #include <bb/cascades/Window>
@@ -138,12 +140,33 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     this->seekChunk = -1;
     this->seekResumePlay = false;
     this->seekLoadingOverlay = 0;
+    this->frameOverlay = 0;
+    this->frameShown = false;
+    this->swapDeferred = false;
+    this->frameCaptureFailures = 0;
     this->seekLoadingSpinner = 0;
     this->sourceClient = 0;
     this->sourceAttempts = 0;
     this->loadedFileFinal = false;
     this->recoveryCount = 0;
     this->remuxBufferPaused = false;
+    this->remuxStatusTicks = 0;
+    this->swapCount = 0;
+    this->advanceMs = 0;
+    this->advanceClock.start();
+    this->freezeHoldMsAtSwap = 0;
+    this->swapBlockedMs = 0;
+    this->userPauseActive = false;
+    this->userPauseLastMs = 0;
+    this->freezeCountStart = this->freezeCountSwap = this->freezeCountHold = this->freezeCountOther = 0;
+    this->freezeMsStart = this->freezeMsSwap = this->freezeMsHold = this->freezeMsOther = this->freezeMaxMs = 0;
+    this->tickCount = 0;
+    this->spareRequested = false;
+    this->spareReady = false;
+    this->progressCount = 0;
+    this->sessionStartClock.start();
+    this->endGuardTimer = new QTimer(this);
+    QObject::connect(endGuardTimer, SIGNAL(timeout()), this, SLOT(onEndGuard()));
     this->staleStateLogged = false;
     this->firstFileWaitActive = false;
     this->remuxWatchdog = new QTimer(this);
@@ -198,6 +221,14 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     backgroundImage->setImageSource(QString("asset:///images/player_background.png"));
     audioBackground->add(backgroundImage);
     root->add(audioBackground);
+
+    // The last picture, kept on screen while the player opens the next file (see showLastFrame).
+    frameOverlay = bb::cascades::ImageView::create();
+    frameOverlay->setVerticalAlignment(bb::cascades::VerticalAlignment::Fill);
+    frameOverlay->setHorizontalAlignment(bb::cascades::HorizontalAlignment::Fill);
+    frameOverlay->setScalingMethod(bb::cascades::ScalingMethod::AspectFit);
+    frameOverlay->setVisible(false);
+    root->add(frameOverlay);
 
     // Shown while waiting for a part of the video that is not downloaded yet
     // (the person seeked there); the earlier, already downloaded parts stay.
@@ -613,6 +644,15 @@ void PlayerPage::onForward10ButtonClick()
 
 void PlayerPage::onMediaStateChanged(bb::multimedia::MediaState::Type state)
 {
+    // Pauses we did not cause (button, headset, ...) are not stalls.
+    if (state == bb::multimedia::MediaState::Paused && !remuxBufferPaused && !remuxSwapping && !seekPending
+            && !userPauseActive) {
+        userPauseActive = true;
+        userPauseClock.start();
+    } else if (state == bb::multimedia::MediaState::Started && userPauseActive) {
+        userPauseLastMs = userPauseClock.elapsed();
+        userPauseActive = false;
+    }
     switch (state) {
         case bb::multimedia::MediaState::Paused:
         case bb::multimedia::MediaState::Stopped:
@@ -672,7 +712,7 @@ void PlayerPage::onMediaStateChanged(bb::multimedia::MediaState::Type state)
 
 void PlayerPage::onPlayActionItemClick()
 {
-    switch (playerContext->getMediaState()) {
+    switch (isReallyPlaying() ? bb::multimedia::MediaState::Started : playerContext->getMediaState()) {
         case bb::multimedia::MediaState::Paused:
         case bb::multimedia::MediaState::Stopped:
         case bb::multimedia::MediaState::Prepared: {
@@ -753,9 +793,12 @@ void PlayerPage::onMetadataReceived(VideoMetadata videoMetadata, StorageData sto
 void PlayerPage::playVideo()
 {
     if (!alreadyPlaying) {
-        // A new video (e.g. next in the playlist): stop downloading the previous one.
+        // A new video (e.g. next in the playlist): stop downloading the previous one...
         clearRemuxSessions();
         pendingRemuxQualityLabel = "";
+        // ...and stop playing it: the title has changed already, but the old
+        // video used to run on until the new one's first file was ready.
+        playerContext->stopForNewVideo();
     }
     setInfos();
 
@@ -850,6 +893,13 @@ void PlayerPage::startPlaybackAt(QString url, int offsetMs, bool partial)
     playingPartialRemux = partial;
     playingStartSec = offsetMs / 1000.0;
     lastPositionMs = (unsigned int) offsetMs;
+    swapCount = 0;
+    advanceMs = (unsigned int) offsetMs;
+    advanceClock.start();
+    freezeCause = "start";
+    spareRequested = false;
+    spareReady = false;
+    if (!seekPending) showSeekLoading(false);
     bb::multimedia::MediaError::Type error = playerContext->play(url);
     if (error == bb::multimedia::MediaError::None) {
         // A remuxed window of the video: positions are video time.
@@ -895,12 +945,53 @@ static const double REMUX_FIRST_FILE_SECONDS = 10.0;
 static const int REMUX_FIRST_FILE_MAX_WAIT_MS = 3000;
 // Pause this close to the end of a file that has no successor yet (see
 // remuxBufferPaused).
-static const double REMUX_PAUSE_BEFORE_END_SECONDS = 0.7;
+// The player's position is only reported once a second, so the end of a file is watched by a 60 ms timer
+// (onEndGuard) on a position estimated between the reports. Pausing 0.7 s before the end from the 1 s tick alone
+// missed about half of the file ends: the file ran out, the player went Stopped and the picture turned black.
+static const double REMUX_PAUSE_BEFORE_END_SECONDS = 0.45;
+static const double REMUX_SWAP_BEFORE_END_SECONDS = 0.3; // swap while the old file still plays (state stays sane)
+static const double REMUX_END_GUARD_ARM_SECONDS = 3.0;
+// Spare source (see checkSpareSource): ask another instance when the first answer is this late, and switch to it
+// when the first host is still silent after the second time.
+static const int REMUX_SPARE_AFTER_MS = 3000;
+static const int REMUX_SPARE_SWITCH_MS = 7500;
 static const int REMUX_MAX_SOURCE_ATTEMPTS = 3;
+// The player turns the picture black while it opens the next file (~1.2 s). Just before that the last picture is
+// read from the video window and shown over it; the swap waits this long so the overlay is on screen first, and
+// the overlay is removed this long after the new file has been started.
+static const int REMUX_SWAP_AFTER_FRAME_MS = 150;
+static const int REMUX_FRAME_HIDE_AFTER_MS = 450;
+static const int REMUX_FRAME_CAPTURE_GIVE_UP = 3; // consecutive captures that produced nothing usable
+// A merged file used to start at chunk 0 and grow with the video, so every
+// swap copied everything again: 27 MB took 2-4 s, 47 MB 8.5 s, 59 MB 10 s on
+// the device -- and the player stalled while the flash was busy. Now a merged
+// file is capped, and once the current one is bigger than the trigger the next
+// one starts a little behind the playhead instead of at chunk 0.
+static const qint64 REMUX_MERGE_MAX_BYTES = 20 * 1024 * 1024;
+static const qint64 REMUX_MERGE_MIN_FORWARD_BYTES = 4 * 1024 * 1024; // the cap never blocks growing
+static const qint64 REMUX_WINDOW_TRIGGER_BYTES = 12 * 1024 * 1024;
+static const double REMUX_WINDOW_KEEP_BEHIND_SECONDS = 30.0;
+// Whole-video copy once everything is downloaded: only for videos up to this size.
+static const qint64 REMUX_FINAL_COPY_MAX_BYTES = 30 * 1024 * 1024;
+// The player reports its position once a second, so a stand-still shorter than ~2 ticks proves nothing. Events we
+// caused ourselves (swap, hold, seek, recovery, start) are always logged; unexplained ones only from this length.
+static const int FREEZE_UNKNOWN_MIN_MS = 2300;
+// Every file swap costs ~1s of black picture (the player has to open the new
+// file). To keep swaps rare the next file is only built once it adds at least
+// this much video beyond the current file's end. The requirement starts low
+// (the first swaps come soon after starting, when waiting would look like a
+// hang) and grows with every swap up to the target.
+static const double REMUX_SWAP_FIRST_GAIN_SECONDS = 10.0;
+static const double REMUX_SWAP_GAIN_STEP_SECONDS = 7.0;
+static const double REMUX_SWAP_TARGET_GAIN_SECONDS = 24.0;
+// ...unless the player has already been held at the end of its file (paused,
+// loading indicator on top) for this long: then it gets whatever there is.
+static const int REMUX_SWAP_HOLD_MAX_MS = 8000;
 
 void PlayerPage::playVideoWithRemux(SingleVideoStorageData videoData)
 {
     pendingRemuxQualityLabel = ""; // "" == this is an initial playback, not a mid-playback quality switch
+    showSeekLoading(true); // until the first file is loaded (startPlaybackAt)
     double startAt = 0;
     if (playerContext->isContinuePlaying() && duration > 0) {
         // Resume where the person stopped: download from there, not from 0:00.
@@ -933,6 +1024,12 @@ void PlayerPage::showSeekLoading(bool show)
 
 void PlayerPage::clearRemuxSessions()
 {
+    logFreezeSummary();
+    endGuardTimer->stop();
+    swapDeferred = false;
+    hideLastFrame();
+    spareRequested = false;
+    spareReady = false;
     // cancel() has to run synchronously before deleteLater(): it aborts the
     // in-flight replies and disconnects them from the session, so no slot
     // can fire into a half-destroyed object.
@@ -1035,6 +1132,10 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData, double star
     QObject::connect(remuxSession, SIGNAL(sourceFailing(QString)), this, SLOT(onSourceFailing(QString)));
     remuxSessionQuality = videoData.quality;
     remuxSessionInstance = storageData.sourceInstance;
+    spareRequested = false;
+    spareReady = false;
+    progressCount = 0;
+    sessionStartClock.start();
     firstFileWaitActive = false;
     if (!remuxWatchdog->isActive()) remuxWatchdog->start(1000);
 
@@ -1052,6 +1153,150 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData, double star
 bool PlayerPage::positionIsAdvancing()
 {
     return lastPositionTickClock.elapsed() < 2500;
+}
+
+// mmrenderer keeps reporting "Stopped" after a file swap although the picture
+// is running (see the "state is stale" log line). The position still moving is
+// the better witness.
+bool PlayerPage::isReallyPlaying()
+{
+    bb::multimedia::MediaState::Type st = playerContext->getMediaState();
+    if (st == bb::multimedia::MediaState::Started) return true;
+    return st == bb::multimedia::MediaState::Stopped && positionIsAdvancing();
+}
+
+// Called for every position tick. When the position moved after having stood
+// still for a while, writes one line: how long, where, and what we know caused
+// it. A swap freeze is split into the time spent waiting for the next file
+// (the picture is held, paused) and the time the player needed to open it
+// (the picture is black).
+void PlayerPage::trackPlaybackGap(unsigned int position)
+{
+    bool movedOn = position > advanceMs + 15;
+    bool jumpedBack = position + 2000 < advanceMs;
+    if (!movedOn && !jumpedBack) return;
+
+    int gap = advanceClock.elapsed();
+    bool explained = !freezeCause.isEmpty();
+    if (userPauseLastMs > 0) {
+        // The person paused: not a stall.
+        qDebug() << "[bbtube][freeze] paused by the person for" << userPauseLastMs << "ms";
+        userPauseLastMs = 0;
+    } else if (explained || gap >= FREEZE_UNKNOWN_MIN_MS) {
+        QString cause = freezeCause.isEmpty() ? QString("unknown") : freezeCause;
+        int holdPart = (cause == "swap") ? freezeHoldMsAtSwap : (cause == "hold" ? gap : 0);
+        if (holdPart > gap) holdPart = gap;
+        int rest = gap - holdPart;
+        QString detail;
+        if (cause == "swap") {
+            // The position is only reported once a second, so the gap is up to ~2 s too long; opening the new file
+            // blocked the UI thread for swapBlockedMs, and that is when the picture is black.
+            if (swapBlockedMs > 0 && swapBlockedMs < rest) rest = swapBlockedMs;
+            detail = QString(" (waited %1 ms for the next file, then the picture was black for ~%2 ms)").arg(holdPart).arg(rest);
+            if (holdPart > 0) {
+                freezeCountHold++;
+                freezeMsHold += holdPart;
+            }
+            freezeCountSwap++;
+            freezeMsSwap += rest;
+        } else if (cause == "hold") {
+            freezeCountHold++;
+            freezeMsHold += gap;
+        } else if (cause == "start") {
+            freezeCountStart++;
+            freezeMsStart += gap;
+        } else {
+            freezeCountOther++;
+            freezeMsOther += gap;
+        }
+        if (gap > freezeMaxMs) freezeMaxMs = gap;
+        qDebug() << "[bbtube][freeze] position stood still for" << gap << "ms at video time" << advanceMs / 1000.0
+                 << "s, resumed at" << position / 1000.0 << "s; cause:" << qPrintable(cause) << qPrintable(detail)
+                 << "; swap number" << swapCount << ", next file ready:" << (pendingSwapPath.isEmpty() ? "no" : "yes");
+    }
+    advanceMs = position;
+    advanceClock.start();
+    freezeCause = "";
+    freezeHoldMsAtSwap = 0;
+}
+
+// Where the player is now: the last reported position plus the time since that report (it plays at normal speed).
+double PlayerPage::estimatedPositionSec()
+{
+    double sec = lastPositionMs / 1000.0;
+    if (isReallyPlaying() && !remuxBufferPaused && !remuxSwapping && !seekPending) {
+        int since = lastPositionTickClock.elapsed();
+        if (since > 1500) since = 1500; // no report for a while: do not run ahead of the player
+        sec += since / 1000.0;
+    }
+    return sec;
+}
+
+void PlayerPage::startEndGuardIfNeeded()
+{
+    if (!playingPartialRemux || remuxSwapping || seekPending || remuxBufferPaused || !remuxPlaybackStarted) return;
+    if (endGuardTimer->isActive()) return;
+    if (remuxPlayableSeconds - estimatedPositionSec() < REMUX_END_GUARD_ARM_SECONDS) endGuardTimer->start(60);
+}
+
+// Runs every 60 ms while the end of the current file is near. If the next file is ready it is swapped in while the
+// old one still plays (a swap from Stopped left the player's state stale); if not, the player is paused so that the
+// last picture stays (a player that runs to the end of its file turns black).
+void PlayerPage::onEndGuard()
+{
+    if (!playingPartialRemux || remuxSwapping || seekPending || remuxBufferPaused || !remuxPlaybackStarted) {
+        endGuardTimer->stop();
+        return;
+    }
+    if (playerContext->getMediaState() == bb::multimedia::MediaState::Paused) return; // the person paused
+    double est = estimatedPositionSec();
+    double remaining = remuxPlayableSeconds - est;
+    if (remaining > REMUX_END_GUARD_ARM_SECONDS + 0.5) {
+        endGuardTimer->stop(); // seeked away
+        return;
+    }
+    if (!pendingSwapPath.isEmpty()) {
+        if (remaining < REMUX_SWAP_BEFORE_END_SECONDS) {
+            endGuardTimer->stop();
+            qDebug() << "[bbtube][swap] swapping while the old file still plays: estimated position" << est
+                     << "s, file ends at" << remuxPlayableSeconds << "s, player state"
+                     << (int) playerContext->getMediaState();
+            swapToPendingFile();
+        }
+        return;
+    }
+    if (remaining < REMUX_PAUSE_BEFORE_END_SECONDS) {
+        endGuardTimer->stop();
+        enterBufferHold(est);
+    }
+}
+
+void PlayerPage::enterBufferHold(double positionSec)
+{
+    remuxBufferPaused = true;
+    remuxHoldClock.start();
+    freezeCause = "hold";
+    remuxRanDry = true;
+    bb::multimedia::MediaState::Type before = playerContext->getMediaState();
+    playerContext->pause();
+    showSeekLoading(true);
+    qDebug() << "[bbtube][chunk] paused at" << positionSec << "s before the end of the file at" << remuxPlayableSeconds
+             << "s (player state before the pause:" << (int) before << ", position last reported"
+             << lastPositionMs / 1000.0 << "s); waiting for the next file, up to"
+             << REMUX_SWAP_HOLD_MAX_MS / 1000.0 << "s so that one swap brings in more video";
+    maybeRequestRemuxMerge();
+}
+
+void PlayerPage::logFreezeSummary()
+{
+    int n = freezeCountStart + freezeCountSwap + freezeCountHold + freezeCountOther;
+    if (n == 0) return;
+    qDebug() << "[bbtube][freeze] summary of this playback: start" << freezeMsStart << "ms; swaps" << freezeCountSwap
+             << "x, total" << freezeMsSwap << "ms; waiting for the next file" << freezeCountHold << "x, total"
+             << freezeMsHold << "ms; other" << freezeCountOther << "x, total" << freezeMsOther << "ms; longest"
+             << freezeMaxMs << "ms";
+    freezeCountStart = freezeCountSwap = freezeCountHold = freezeCountOther = 0;
+    freezeMsStart = freezeMsSwap = freezeMsHold = freezeMsOther = freezeMaxMs = 0;
 }
 
 bool PlayerPage::enoughForFirstFile(int startChunk)
@@ -1103,9 +1348,35 @@ void PlayerPage::maybeRequestRemuxMerge()
     if (ps && remuxPlaybackStarted && playingPartialRemux && pendingSwapPath.isEmpty()
             && !ps->isMerging() && ps->headsReady()) {
         int end = playingStartChunk + playingChunkCount;
-        if (ps->runEnd(playingStartChunk) > end && remuxPlayableSeconds - posSec < lead) {
-            markMergeRequested();
-            ps->requestMerge(playingStartChunk);
+        int storedEnd = ps->runEnd(playingStartChunk);
+        if (storedEnd > end && remuxPlayableSeconds - posSec < lead) {
+            // Time to decide whether the next file is worth a swap.
+            double gain = ps->chunkEndSeconds(storedEnd - 1) - remuxPlayableSeconds;
+            double minGain = REMUX_SWAP_FIRST_GAIN_SECONDS + REMUX_SWAP_GAIN_STEP_SECONDS * swapCount;
+            if (minGain > REMUX_SWAP_TARGET_GAIN_SECONDS) minGain = REMUX_SWAP_TARGET_GAIN_SECONDS;
+            bool toVideoEnd = storedEnd >= ps->chunkCount() || ps->isDownloadComplete();
+            bool holdExpired = remuxBufferPaused && remuxHoldClock.elapsed() >= REMUX_SWAP_HOLD_MAX_MS;
+            if (gain >= minGain || toVideoEnd || holdExpired) {
+                qDebug() << "[bbtube][swap] building the next file: it adds" << gain << "s past the current end at"
+                         << remuxPlayableSeconds << "s;" << (gain >= minGain ? "enough"
+                                 : (toVideoEnd ? "reaches the end of the video" : "waited long enough"));
+                markMergeRequested();
+                // Closed captions are matched to the file's own timeline, so with CC on the files keep starting at 0.
+                bool windowed = playerContext->getCcLanguage().isEmpty();
+                int reqStart = playingStartChunk;
+                if (windowed && ps->stagedBytes(playingStartChunk, end) > REMUX_WINDOW_TRIGGER_BYTES) {
+                    int k = ps->chunkIndexAt(posSec - REMUX_WINDOW_KEEP_BEHIND_SECONDS);
+                    if (k > playingStartChunk && k < end && ps->isChunkStored(k)) reqStart = k;
+                }
+                qint64 cap = 0;
+                if (windowed) {
+                    cap = ps->stagedBytes(reqStart, end) + REMUX_MERGE_MIN_FORWARD_BYTES;
+                    if (cap < REMUX_MERGE_MAX_BYTES) cap = REMUX_MERGE_MAX_BYTES;
+                }
+                qDebug() << "[bbtube][swap] merged file will start at chunk" << reqStart << "(current file starts at"
+                         << playingStartChunk << "), size cap" << cap / 1024 << "KB;" << (windowed ? "windowed" : "captions on: keeps starting at chunk 0");
+                ps->requestMerge(reqStart, cap);
+            }
         }
     }
 
@@ -1143,6 +1414,10 @@ void PlayerPage::maybeRequestFinalCopy()
     if (finalCopyRequested || !remuxSession || seekPending || remuxSession->isMerging()) return;
     if (!remuxSession->isDownloadComplete() || remuxSession != playingSession()) return;
     if (playingStartChunk == 0 && !playingPartialRemux) return; // already playing the final file
+    if (remuxSession->stagedBytes(0, remuxSession->chunkCount()) > REMUX_FINAL_COPY_MAX_BYTES
+            && playerContext->getCcLanguage().isEmpty()) {
+        return; // copying a video this big would stall the player; windowed files do the job
+    }
     finalCopyRequested = true;
     remuxSession->requestMerge(0);
 }
@@ -1151,6 +1426,7 @@ void PlayerPage::onRemuxProgress(int chunkIndex)
 {
     Q_UNUSED(chunkIndex);
     sourceAttempts = 0; // data is flowing again (possibly from a replacement source)
+    if ((++progressCount % 8) == 0) recordInstancePerformance();
     if (seekPending) {
         if (!seekMergeRequested && remuxSession && enoughForFirstFile(seekChunk)) {
             requestSeekMerge();
@@ -1168,7 +1444,7 @@ void PlayerPage::requestSeekMerge()
     int a = remuxSession->fileStartFor(seekChunk, REMUX_SEEK_FILE_BACK_SECONDS);
     qDebug() << "[bbtube][chunk] seek: chunk" << seekChunk << "is stored, merging file starting at chunk" << a;
     markMergeRequested();
-    remuxSession->requestMerge(a);
+    remuxSession->requestMerge(a, REMUX_MERGE_MAX_BYTES);
 }
 
 // Hands a merged file to the player.
@@ -1200,6 +1476,7 @@ void PlayerPage::loadMergedFile(QString label, QString path, ChunkedRemuxSession
     playerContext->setSeekIntercept(windowed);
     changeQuality(label, path, forcePlay, absMs);
     remuxSwapping = false;
+    if (freezeCause.isEmpty()) freezeCause = "reload";
 
     remuxStallToastShown = false;
     remuxRanDry = false;
@@ -1211,7 +1488,7 @@ void PlayerPage::loadMergedFile(QString label, QString path, ChunkedRemuxSession
     loadedFileFinal = isFinal;
     if (remuxBufferPaused) {
         remuxBufferPaused = false;
-        if (!seekPending) showSeekLoading(false);
+        if (!seekPending && !frameShown) showSeekLoading(false); // with the last picture up, hideLastFrame() does it
     }
     if (windowed && !remuxWatchdog->isActive()) remuxWatchdog->start(1000);
     qDebug() << "[bbtube][chunk] loaded" << path << ": chunks" << startChunk << "+" << chunkCount
@@ -1225,8 +1502,9 @@ void PlayerPage::queuePendingSwap(ChunkedRemuxSession *session, QString path, in
         int chunkCount, bool isFinal)
 {
     int curEnd = playingStartChunk + playingChunkCount;
-    // Only a file that begins at or before the current one and reaches further is a continuation.
-    if (startChunk > playingStartChunk || startChunk + chunkCount <= curEnd) {
+    // A continuation contains the chunk the current file ends at (that is where playback resumes) and reaches
+    // further. It may begin later than the current file does (windowed merges).
+    if (startChunk > curEnd || startChunk + chunkCount <= curEnd) {
         qDebug() << "[bbtube][chunk] ignoring merged file chunks" << startChunk << "+" << chunkCount
                  << "- not an extension of" << playingStartChunk << "+" << playingChunkCount;
         return;
@@ -1249,7 +1527,61 @@ void PlayerPage::queuePendingSwap(ChunkedRemuxSession *session, QString path, in
     }
 }
 
+// Reads the last picture from the video window and puts it on screen, with the spinner, over the black that the
+// player is about to produce. Returns false -- and nothing changes -- if the window cannot be read, or reads black.
+bool PlayerPage::showLastFrame()
+{
+    if (!frameOverlay || audioOnly || frameCaptureFailures >= REMUX_FRAME_CAPTURE_GIVE_UP) return false;
+    QString info;
+    bb::ImageData img = playerContext->captureVideoFrame(&info);
+    qDebug() << "[bbtube][frame] capture of the last picture:" << qPrintable(info);
+    if (!img.isValid()) {
+        frameCaptureFailures++;
+        if (frameCaptureFailures >= REMUX_FRAME_CAPTURE_GIVE_UP) {
+            qDebug() << "[bbtube][frame] giving up: the video window cannot be read on this device";
+        }
+        return false;
+    }
+    frameCaptureFailures = 0;
+    frameOverlay->setImage(bb::cascades::Image(img));
+    frameOverlay->setVisible(true);
+    showSeekLoading(true);
+    frameShown = true;
+    frameShownClock.start();
+    return true;
+}
+
+void PlayerPage::hideLastFrame()
+{
+    if (!frameShown) return;
+    frameShown = false;
+    if (frameOverlay) frameOverlay->setVisible(false);
+    if (!remuxBufferPaused && !seekPending && !(remuxSession && !remuxPlaybackStarted)) showSeekLoading(false);
+}
+
+// The swap proper starts REMUX_SWAP_AFTER_FRAME_MS after the picture has been put on screen.
 void PlayerPage::swapToPendingFile()
+{
+    if (swapDeferred) return;
+    if (!pendingSwapPath.isEmpty() && showLastFrame()) {
+        swapDeferred = true;
+        QTimer::singleShot(REMUX_SWAP_AFTER_FRAME_MS, this, SLOT(onDeferredSwap()));
+        return;
+    }
+    doSwapToPendingFile();
+}
+
+void PlayerPage::onDeferredSwap()
+{
+    swapDeferred = false;
+    if (!pendingSwapPath.isEmpty() && remuxPlaybackStarted && !remuxSwapping) {
+        doSwapToPendingFile();
+    } else {
+        hideLastFrame();
+    }
+}
+
+void PlayerPage::doSwapToPendingFile()
 {
     if (pendingSwapPath.isEmpty() || pendingSwapSession.isNull() || remuxSwapping) return;
     QString path = pendingSwapPath;
@@ -1264,9 +1596,19 @@ void PlayerPage::swapToPendingFile()
     // a mid-GOP seek would turn into a rewind to the previous keyframe).
     int boundary = playingStartChunk + playingChunkCount;
     double resume = session->fileResumeSeconds(start, boundary);
+    swapCount++;
+    swapClock.start();
+    freezeHoldMsAtSwap = remuxBufferPaused ? remuxHoldClock.elapsed() : 0;
+    freezeCause = "swap";
     qDebug() << "[bbtube][chunk] swapping: old file ended at" << remuxPlayableSeconds
-             << "s (player at" << lastPositionMs / 1000.0 << "s), boundary chunk" << boundary;
+             << "s (player at" << lastPositionMs / 1000.0 << "s), boundary chunk" << boundary
+             << ", swap number" << swapCount << ", held for buffering:" << (remuxBufferPaused ? "yes" : "no")
+             << ", player state before the swap:" << (int) playerContext->getMediaState();
     loadMergedFile(quality, path, session, start, count, isFinal, resume, -1.0, true);
+    swapBlockedMs = swapClock.elapsed();
+    if (frameShown) QTimer::singleShot(REMUX_FRAME_HIDE_AFTER_MS, this, SLOT(hideLastFrame()));
+    qDebug() << "[bbtube][swap] swap" << swapCount << "blocked the UI thread for" << swapBlockedMs
+             << "ms (the picture stays black until the player has opened the new file)";
 
     maybeRequestRemuxMerge();
 }
@@ -1305,6 +1647,7 @@ void PlayerPage::onRemuxMerged(QString path, int startChunk, int chunkCount, boo
             seekPending = false;
             seekMergeRequested = false;
             showSeekLoading(false);
+            swapCount = 0;
             loadMergedFile(label, path, remuxSession, startChunk, chunkCount, isFinal, T - fs, T,
                     resumePlay);
             if (retiringRemuxSession) {
@@ -1406,6 +1749,7 @@ void PlayerPage::onRemuxFailed(QString errorMessage)
     }
     if (!remuxPlaybackStarted) {
         // Nothing has played yet -- there is nothing to fall back on.
+        showSeekLoading(false);
         UIUtils::toastError("Source unavailable");
     } else {
         // Something is already playing; keep whatever was downloaded so far
@@ -1466,10 +1810,13 @@ void PlayerPage::beginRemuxSeek(unsigned int positionMs)
 
     if (!seekPending) {
         bb::multimedia::MediaState::Type st = playerContext->getMediaState();
-        seekResumePlay = (st == bb::multimedia::MediaState::Started) || remuxRanDry;
+        // isReallyPlaying(): after a file swap the state reads Stopped although the picture runs; a seek
+        // then used to leave the player paused until the watchdog "recovered" it ~10 s later.
+        seekResumePlay = isReallyPlaying() || remuxRanDry;
         playerContext->pause(); // freezes the old file: no more position ticks while loading
     }
     seekPending = true;
+    freezeCause = "seek";
     seekMergeRequested = false;
     seekTargetMs = (unsigned int) (t * 1000.0);
     pendingSwapPath = "";
@@ -1495,7 +1842,9 @@ void PlayerPage::beginRemuxSeek(unsigned int positionMs)
 //    own: reload the file at the keyframe before the stop point.
 void PlayerPage::onRemuxWatchdog()
 {
+    if (frameShown && frameShownClock.elapsed() > 6000) hideLastFrame(); // never leave a stale picture up
     if (!remuxSession && !retiringRemuxSession) return;
+    checkSpareSource();
 
     if (seekPending) {
         if (!seekMergeRequested && remuxSession && remuxSession->headsReady()
@@ -1504,8 +1853,24 @@ void PlayerPage::onRemuxWatchdog()
         }
         return;
     }
-    if (!remuxPlaybackStarted || pendingRemuxQualityLabel != "") {
+    if (!remuxPlaybackStarted || pendingRemuxQualityLabel != "" || remuxBufferPaused) {
         maybeRequestRemuxMerge();
+    }
+    if (remuxPlaybackStarted && (++remuxStatusTicks % 5) == 0) {
+        ChunkedRemuxSession *ss = playingSession();
+        double downloadedTo = -1.0;
+        if (ss && ss->headsReady() && playingChunkCount > 0) {
+            downloadedTo = ss->chunkEndSeconds(ss->runEnd(playingStartChunk) - 1);
+        }
+        qDebug() << "[bbtube][play] status: position" << lastPositionMs / 1000.0 << "s, file ends at"
+                 << remuxPlayableSeconds << "s, downloaded up to" << downloadedTo << "s, next file ready:"
+                 << (pendingSwapPath.isEmpty() ? "no" : "yes") << ", held for buffering:"
+                 << (remuxBufferPaused ? "yes" : "no") << ", position advancing:"
+                 << (positionIsAdvancing() ? "yes" : "no") << ", player state" << (int) playerContext->getMediaState()
+                 << ", position ticks since the last line" << tickCount << "; frozen so far: start" << freezeMsStart
+                 << "ms, swaps" << freezeCountSwap << "x" << freezeMsSwap << "ms, holds" << freezeCountHold << "x"
+                 << freezeMsHold << "ms, other" << freezeCountOther << "x" << freezeMsOther << "ms";
+        tickCount = 0;
     }
     if (!remuxPlaybackStarted || remuxSwapping || remuxBufferPaused) return;
     if (!(playingPartialRemux || playingStartSec > 0.01)) return;
@@ -1517,6 +1882,11 @@ void PlayerPage::onRemuxWatchdog()
     bool paused = (st == bb::multimedia::MediaState::Paused);
     bool stuck = !grace && !paused && !positionIsAdvancing();
     if (!stuck) {
+        if (st == bb::multimedia::MediaState::Stopped && positionIsAdvancing()) {
+            // The button would show "Play" while the video runs.
+            playActionItem->setTitle("Pause");
+            playActionItem->setImageSource(QString("asset:///images/ic_pause.png"));
+        }
         if (st == bb::multimedia::MediaState::Stopped && positionIsAdvancing() && !staleStateLogged) {
             staleStateLogged = true;
             qDebug() << "[bbtube][chunk] player state reads Stopped but the position is advancing - the state is stale after the swap, playback is fine";
@@ -1541,12 +1911,16 @@ void PlayerPage::onRemuxWatchdog()
             if (!remuxStallToastShown) {
                 remuxStallToastShown = true;
                 remuxBufferPaused = true;
+                remuxHoldClock.start();
+                freezeCause = "hold";
                 showSeekLoading(true);
             }
             maybeRequestRemuxMerge();
         }
     } else {
         qDebug() << "[bbtube][chunk] watchdog: player stopped/froze at" << posMs / 1000.0 << "s (state" << st
+                 << ", merge running:" << ((remuxSession && remuxSession->isMerging()) ? "yes" : "no")
+                 << ", downloads in flight:" << (remuxSession ? remuxSession->inflightCount() : 0)
                  << ") although its file runs to" << remuxPlayableSeconds << "s - recovering";
         recoverPlayback(posMs);
     }
@@ -1591,6 +1965,7 @@ void PlayerPage::recoverPlayback(unsigned int posMs)
     if (k >= start + count) k = start + count - 1;
     double resume = s->fileResumeSeconds(start, k);
     qDebug() << "[bbtube][chunk] recovery" << recoveryCount << "of 3: reloading" << path << "from chunk" << k;
+    freezeCause = "recovery";
     loadMergedFile(quality, path, s, start, count, isFinal, resume, -1.0, true);
 }
 
@@ -1624,15 +1999,91 @@ void PlayerPage::onSourceFailing(QString reason)
     if (sourceAttempts == 1 && !isLiveStream) {
         UIUtils::toastInfo("Server problem, trying another one...");
     }
-    sourceClient->fetchVideo(videoMetadata.video.videoId);
+    if (spareReady) {
+        applySpareSource(); // already asked for while the first host was silent
+        return;
+    }
+    if (spareRequested) {
+        return; // on its way: onAltSourceReceived hands it to this session
+    }
+    QStringList exclude;
+    exclude << instance;
+    sourceClient->fetchVideo(videoMetadata.video.videoId, exclude);
+}
+
+// While the very first requests to the stream host get no answer, ask another instance for the same video in
+// parallel. If the first host then fails -- or is still silent after REMUX_SPARE_SWITCH_MS -- the spare is used
+// at once instead of starting the search only then (which cost 5-17 s on top of the 8-50 s of waiting).
+void PlayerPage::checkSpareSource()
+{
+    if (!remuxSession || remuxPlaybackStarted || remuxSession->headsReady() || isLiveStream || !sourceClient) return;
+    if (!failoverSession.isNull() || seekPending) return;
+    int elapsed = sessionStartClock.elapsed();
+    if (!spareRequested && !spareReady && elapsed >= REMUX_SPARE_AFTER_MS) {
+        spareRequested = true;
+        qDebug() << "[bbtube][chunk] no answer from the stream host" << remuxSessionInstance << "after" << elapsed
+                 << "ms - asking another instance in parallel";
+        QStringList exclude;
+        exclude << remuxSessionInstance;
+        sourceClient->fetchVideo(videoMetadata.video.videoId, exclude);
+    }
+    if (spareReady && elapsed >= REMUX_SPARE_SWITCH_MS) {
+        qDebug() << "[bbtube][chunk] the stream host is still silent after" << elapsed << "ms - using the spare instance"
+                 << spareInstance;
+        remuxSession->abandonSlowSource(QString("no answer after %1 ms").arg(elapsed));
+    }
+}
+
+void PlayerPage::applySpareSource()
+{
+    ChunkedRemuxSession *s = failoverSession;
+    failoverSession = 0;
+    spareReady = false;
+    if (!s) return;
+    bool isRetiring = (s == retiringRemuxSession);
+    qDebug() << "[bbtube][chunk] alternative instance (asked for in advance)" << spareInstance << "- switching";
+    if (isRetiring) retiringSessionInstance = spareInstance;
+    else remuxSessionInstance = spareInstance;
+    s->replaceSources(spareVideoUrl, spareAudioUrl);
+}
+
+// Every few chunks: how fast is this instance, relative to playback? The instance picker prefers fast ones.
+void PlayerPage::recordInstancePerformance()
+{
+    if (!remuxSession || !remuxPlaybackStarted || remuxSessionInstance.isEmpty()
+            || !ApplicationUI::invidiousInstanceManager || !remuxSession->headsReady()) return;
+    double ratio = remuxSession->recentRatio(40000);
+    double pos = lastPositionMs / 1000.0;
+    int k = remuxSession->chunkIndexAt(pos);
+    double ahead = 0.0;
+    if (remuxSession->isChunkStored(k)) ahead = remuxSession->chunkEndSeconds(remuxSession->runEnd(k) - 1) - pos;
+    // Far ahead of the playhead the downloader may be idle on purpose: that instance clearly keeps up.
+    if (ahead >= 45.0) ratio = 2.5;
+    if (ratio > 0) ApplicationUI::invidiousInstanceManager->recordPerformance(remuxSessionInstance, ratio);
 }
 
 void PlayerPage::onAltSourceReceived(VideoMetadata altMetadata, StorageData altStorage)
 {
     Q_UNUSED(altMetadata);
+    bool spareInFlight = spareRequested;
+    spareRequested = false;
     ChunkedRemuxSession *s = failoverSession;
     failoverSession = 0;
-    if (!s) return;
+    if (!s) {
+        if (!spareInFlight || !remuxSession || remuxPlaybackStarted) return;
+        // The spare for a session that is still waiting for its first answer: keep the urls for later.
+        for (int i = 0; i < altStorage.instances.count(); i++) {
+            if (altStorage.instances[i].quality == remuxSessionQuality && !altStorage.audio.url.isEmpty()) {
+                spareVideoUrl = altStorage.instances[i].url;
+                spareAudioUrl = altStorage.audio.url;
+                spareInstance = altStorage.sourceInstance;
+                spareReady = true;
+                qDebug() << "[bbtube][chunk] spare instance ready:" << spareInstance;
+                break;
+            }
+        }
+        return;
+    }
     bool isRetiring = (s == retiringRemuxSession);
     QString wanted = isRetiring ? retiringSessionQuality : remuxSessionQuality;
 
@@ -1658,6 +2109,7 @@ void PlayerPage::onAltSourceReceived(VideoMetadata altMetadata, StorageData altS
 
 void PlayerPage::onAltSourceError(QString message)
 {
+    spareRequested = false;
     ChunkedRemuxSession *s = failoverSession;
     if (s == 0) return;
     failoverSession = 0;
@@ -1776,8 +2228,12 @@ void PlayerPage::onPlayerPositionChanged(unsigned int position)
         lastPositionTickClock.start();
     }
     lastPositionMs = position;
+    tickCount++;
+    trackPlaybackGap(position);
 
-    if (remuxSession) {
+    // Before the first file of this video is loaded the ticks belong to
+    // whatever played before: they must not move the download playhead.
+    if (remuxSession && remuxPlaybackStarted) {
         remuxSession->setPlayhead(position / 1000.0);
     }
     if (remuxSession || retiringRemuxSession) {
@@ -1792,14 +2248,9 @@ void PlayerPage::onPlayerPositionChanged(unsigned int position)
             && !seekPending
             && playerContext->getMediaState() != bb::multimedia::MediaState::Paused
             && remuxPlayableSeconds - position / 1000.0 < REMUX_PAUSE_BEFORE_END_SECONDS) {
-        remuxBufferPaused = true;
-        remuxRanDry = true;
-        playerContext->pause();
-        showSeekLoading(true);
-        qDebug() << "[bbtube][chunk] paused at" << position / 1000.0 << "s before the end of the file at"
-                 << remuxPlayableSeconds << "s; waiting for the next one";
-        maybeRequestRemuxMerge();
+        enterBufferHold(position / 1000.0);
     }
+    startEndGuardIfNeeded();
     // Normally the swap happens when the player reports the end of the file
     // (onMediaStateChanged); this catches a player that is still "Started"
     // but about to run out.
@@ -2498,6 +2949,8 @@ void PlayerPage::onDoubleTappedHandler(bb::cascades::DoubleTapEvent* e)
 
 void PlayerPage::changeQuality(QString newQuality, QString url, bool forcePlay, int seekMs)
 {
+    QTime perf;
+    perf.start();
     quality = newQuality;
     qualityActionItem->setTitle(quality);
     setProgressSliderEnabled(!audioOnly);
@@ -2517,7 +2970,10 @@ void PlayerPage::changeQuality(QString newQuality, QString url, bool forcePlay, 
         playerContext->resizeFullScreenVideo();
     }
 
+    int uiMs = perf.elapsed();
     bb::multimedia::MediaError::Type error = playerContext->changeQuality(url, forcePlay, seekMs);
+    qDebug() << "[bbtube][player] changeQuality: page updates took" << uiMs << "ms, handing the file to the player took"
+             << perf.elapsed() - uiMs << "ms";
     if (error != bb::multimedia::MediaError::None) {
         UIUtils::toastError("Source unavailable");
     }

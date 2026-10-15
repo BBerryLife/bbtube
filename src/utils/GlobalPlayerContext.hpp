@@ -14,6 +14,8 @@
 #include <bb/multimedia/RepeatMode>
 
 #include <bb/cascades/ForeignWindowControl>
+#include <bb/ImageData>
+#include <bb/PixelFormat>
 #include <bb/cascades/UIOrientation>
 #include <bb/cascades/ScalingMethod>
 
@@ -112,6 +114,12 @@ public:
     void setSelectedStorageData(SingleVideoStorageData storageData);
     void setAudioOnly(bool audioOnly);
     void pause();
+    // A different video is about to start: the previous one must not keep playing
+    // while the new one is still being prepared.
+    void stopForNewVideo();
+    // The current picture of the video window, scaled down, or an invalid image when it cannot be read (the video
+    // may be drawn by a hardware overlay that a window read does not see). `info` says what happened.
+    bb::ImageData captureVideoFrame(QString *info);
     void seekTime(unsigned int);
     void skipXSecondsBackward(unsigned int);
     void skipXSecondsForward(unsigned int);

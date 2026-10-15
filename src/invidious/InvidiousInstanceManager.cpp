@@ -174,7 +174,19 @@ void InvidiousInstanceManager::markBad(const QString &instanceBaseUrl, int minut
     qDebug() << "[bbtube][invidious] marking instance as bad for" << minutes << "min:" << key;
 }
 
-QString InvidiousInstanceManager::pickRandomInstance() const
+void InvidiousInstanceManager::recordPerformance(const QString &instanceBaseUrl, double ratio)
+{
+    if (instanceBaseUrl.isEmpty() || ratio <= 0) return;
+    QString key = instanceBaseUrl;
+    while (key.endsWith('/')) key.chop(1);
+    double smoothed = ratio;
+    QMap<QString, double>::iterator it = perfRatio.find(key);
+    if (it != perfRatio.end()) smoothed = 0.5 * it.value() + 0.5 * ratio;
+    perfRatio[key] = smoothed;
+    qDebug() << "[bbtube][invidious] download speed of" << key << ":" << ratio << "x playback, smoothed" << smoothed;
+}
+
+QString InvidiousInstanceManager::pickRandomInstance(const QStringList &exclude) const
 {
     QStringList all;
     if (!liveInstances.isEmpty()) {
@@ -189,16 +201,45 @@ QString InvidiousInstanceManager::pickRandomInstance() const
     }
 
     qint64 now = QDateTime::currentMSecsSinceEpoch();
-    QStringList good;
+    QStringList good, goodNotExcluded;
     for (int i = 0; i < all.size(); i++) {
         QString key = all[i];
         while (key.endsWith('/')) key.chop(1);
         QMap<QString, qint64>::iterator it = badUntilMs.find(key);
         if (it != badUntilMs.end() && it.value() > now) continue;
         good << all[i];
+        bool excluded = false;
+        for (int e = 0; e < exclude.size(); e++) {
+            QString ex = exclude[e];
+            while (ex.endsWith('/')) ex.chop(1);
+            if (ex == key) excluded = true;
+        }
+        if (!excluded) goodNotExcluded << all[i];
+    }
+    if (!goodNotExcluded.isEmpty()) {
+        good = goodNotExcluded;
     }
     if (good.isEmpty()) {
         good = all; // everything is marked bad: better a bad instance than none
     }
-    return good[qrand() % good.count()];
+
+    // Prefer instances that were measured fast, avoid those measured slow; the rest (never measured) still
+    // get their turn so that new fast ones are found.
+    QStringList fast, rest, slow;
+    for (int i = 0; i < good.size(); i++) {
+        QString key = good[i];
+        while (key.endsWith('/')) key.chop(1);
+        QMap<QString, double>::const_iterator it = perfRatio.constFind(key);
+        if (it == perfRatio.constEnd()) rest << good[i];
+        else if (it.value() >= 1.5) fast << good[i];
+        else if (it.value() >= 0.9) rest << good[i];
+        else slow << good[i];
+    }
+    const QStringList *pool = &rest;
+    if (!fast.isEmpty() && (rest.isEmpty() || qrand() % 100 < 60)) pool = &fast;
+    else if (rest.isEmpty()) pool = &slow;
+    QString picked = (*pool)[qrand() % pool->count()];
+    qDebug() << "[bbtube][invidious] picked" << picked << "- candidates:" << good.count() << ", measured fast:"
+             << fast.count() << ", measured slow:" << slow.count();
+    return picked;
 }

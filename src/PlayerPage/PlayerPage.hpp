@@ -15,6 +15,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <bb/cascades/ActivityIndicator>
+#include <bb/cascades/ImageView>
 #include <bb/cascades/Container>
 #include <QTime>
 
@@ -102,6 +103,9 @@ private slots:
     void onSourceFailing(QString reason);
     void onAltSourceReceived(VideoMetadata videoMetadata, StorageData storageData);
     void onAltSourceError(QString message);
+    void onEndGuard();
+    void onDeferredSwap();
+    void hideLastFrame();
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -216,12 +220,42 @@ private:
     // Paused just before the end of a partial file (instead of letting it stop,
     // which turns the picture black) until the next file is ready.
     bool remuxBufferPaused;
+    QTime remuxHoldClock; // since when the player is held at the end of its file, waiting for a bigger next file
+    int remuxStatusTicks; // watchdog runs, for the periodic status line in the log
+    QTime swapClock; // start of the current file swap
+    int swapCount;
+    // --- freeze log: how long the position stood still, and why ---
+    QTime advanceClock; // when the position last moved
+    unsigned int advanceMs; // ...and where it was then (video time)
+    QString freezeCause; // what happened since: "start", "swap", "hold", "seek", "recovery", "reload" (empty: nothing we did)
+    int freezeHoldMsAtSwap; // part of a swap freeze that was spent waiting for the next file
+    int swapBlockedMs; // how long the last swap blocked the UI thread (~ black picture)
+    QTime userPauseClock;
+    bool userPauseActive;
+    int userPauseLastMs;
+    int freezeCountStart, freezeCountSwap, freezeCountHold, freezeCountOther;
+    int freezeMsStart, freezeMsSwap, freezeMsHold, freezeMsOther, freezeMaxMs;
+    int tickCount; // position ticks since the last status line
+    // The player reports its position once a second; this 60 ms timer runs only when the end of the current file
+    // is near, to pause / swap at the right moment (see onEndGuard).
+    QTimer *endGuardTimer;
+    // A second instance asked for in parallel when the stream host is slow to answer the first requests.
+    QTime sessionStartClock;
+    bool spareRequested, spareReady;
+    QString spareVideoUrl, spareAudioUrl, spareInstance;
+    int progressCount;
     bool staleStateLogged;
     // The very first file (and the first file after a seek) waits for ~10s of
     // video so that the player has time to spare while later chunks download.
     bool firstFileWaitActive;
     QTime firstFileWaitClock;
     bb::cascades::Container *seekLoadingOverlay;
+    // A picture of the last frame, shown over the black that the player produces while it opens the next file.
+    bb::cascades::ImageView *frameOverlay;
+    bool frameShown;
+    bool swapDeferred;
+    int frameCaptureFailures;
+    QTime frameShownClock;
     bb::cascades::ActivityIndicator *seekLoadingSpinner;
     QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
@@ -249,6 +283,17 @@ private:
     bool positionIsAdvancing();
     void recoverPlayback(unsigned int positionMs);
     void swapToPendingFile();
+    void doSwapToPendingFile();
+    bool showLastFrame();
+    void trackPlaybackGap(unsigned int position);
+    double estimatedPositionSec();
+    void startEndGuardIfNeeded();
+    void enterBufferHold(double positionSec);
+    void checkSpareSource();
+    void applySpareSource();
+    void recordInstancePerformance();
+    void logFreezeSummary();
+    bool isReallyPlaying();
     void markMergeRequested();
     void seekWithinPlayable(unsigned int positionMs);
     QString remuxCacheDir();

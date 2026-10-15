@@ -45,7 +45,8 @@ public:
     // videoId: an 11-character YouTube video ID (use
     // YoutubeClient::getVideoId() to extract one from a URL/search text
     // before calling this -- this class does not do URL parsing itself).
-    void fetchVideo(const QString &videoId);
+    // exclude: instances not to ask (the retries on failure honour it too).
+    void fetchVideo(const QString &videoId, const QStringList &exclude = QStringList());
 
 signals:
     void error(QString message);
@@ -68,6 +69,7 @@ private:
     // seconds of retry time in the worst case (all instances actually
     // are down).
     static const int MAX_INSTANCE_ATTEMPTS = 5;
+    QStringList excludedInstances;
 
     void requestFromInstance(const QString &videoId, const QString &instanceBaseUrl,
             int attemptNumber);

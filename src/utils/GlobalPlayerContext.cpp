@@ -1,4 +1,7 @@
 #include "GlobalPlayerContext.hpp"
+#include <QTime>
+#include <errno.h>
+#include <QDebug>
 #include "src/db/DbHelper.hpp"
 #include "src/utils/PlaylistVideoProxy.hpp"
 #include "src/models/PlaylistVideoModel.hpp"
@@ -235,6 +238,8 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url, bool forcePlay,
         int seekMs)
 {
+    QTime perf;
+    perf.start();
     int currPosition = mediaPlayer->position();
     bb::multimedia::MediaState::Type currState = mediaPlayer->mediaState();
     // Same scheme-less-local-path issue as play() above -- see comment there.
@@ -243,7 +248,9 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url,
         mediaUrl = QUrl::fromLocalFile(url);
     }
     mediaPlayer->setSourceUrl(mediaUrl);
+    int tSource = perf.elapsed();
     mediaPlayer->prepare();
+    int tPrepare = perf.elapsed();
 
     // seekMs >= 0: the caller knows exactly where the new file must resume
     // (a keyframe boundary -- see ChunkedRemuxSession::keyframeResumeSeconds).
@@ -256,13 +263,19 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url,
     if (!audioOnly) {
         mediaPlayer->seekTime(target);
     }
+    int tSeek = perf.elapsed();
     // forcePlay: resume even though the old (partial) file had already run
     // out of data and the player sat in Stopped.
     if (currState == bb::multimedia::MediaState::Started || forcePlay) {
         bb::multimedia::MediaError::Type error = mediaPlayer->play();
+        qDebug() << "[bbtube][player] changeQuality calls: setSourceUrl" << tSource << "ms, prepare +"
+                 << tPrepare - tSource << "ms, seekTime(" << target << ") +" << tSeek - tPrepare << "ms, play +"
+                 << perf.elapsed() - tSeek << "ms";
 
         return error;
     }
+    qDebug() << "[bbtube][player] changeQuality calls: setSourceUrl" << tSource << "ms, prepare +"
+             << tPrepare - tSource << "ms, seekTime(" << target << ") +" << tSeek - tPrepare << "ms (not playing)";
 
     return bb::multimedia::MediaError::None;
 }
@@ -272,7 +285,149 @@ QString GlobalPlayerContext::getSourceUrl()
 }
 void GlobalPlayerContext::pause()
 {
-    mediaPlayer->pause();
+    bb::multimedia::MediaState::Type before = mediaPlayer->mediaState();
+    bb::multimedia::MediaError::Type error = mediaPlayer->pause();
+    qDebug() << "[bbtube][player] pause(): state before" << (int) before << ", result" << (int) error
+             << ", state right after" << (int) mediaPlayer->mediaState();
+}
+// The byte order of the screen's RGBA8888 pixels in memory. The BlackBerry samples read such a buffer as a
+// QImage::Format_ARGB32, which on this little-endian CPU means blue, green, red, alpha. If the picture ever
+// shows with red and blue exchanged, set this to 0.
+#define SCREEN_PIXELS_ARE_BGRA 1
+
+// A picture that is (almost) all black is not worth showing: the window read can succeed and still return nothing
+// (a video drawn by a hardware overlay is not in the window's own buffer). Works on the raw bytes, so the channel
+// order does not matter.
+static bool pictureLooksBlank(const unsigned char *pixels, int width, int height, int stride)
+{
+    if (width < 16 || height < 16) return true;
+    int bright = 0;
+    int samples = 0;
+    int stepY = height / 12;
+    int stepX = width / 16;
+    if (stepY < 1) stepY = 1;
+    if (stepX < 1) stepX = 1;
+    for (int y = stepY / 2; y < height; y += stepY) {
+        for (int x = stepX / 2; x < width; x += stepX) {
+            const unsigned char *p = pixels + y * stride + x * 4;
+            samples++;
+            if (p[0] + p[1] + p[2] > 60) bright++;
+        }
+    }
+    return bright * 20 < samples; // fewer than 5% of the sampled pixels are brighter than near-black
+}
+
+bb::ImageData GlobalPlayerContext::captureVideoFrame(QString *info)
+{
+    QTime perf;
+    perf.start();
+    QString note;
+    bb::ImageData result;
+    screen_pixmap_t pix = 0;
+    bool havePix = false;
+    do {
+        if (!windowHandle) {
+            note = "no video window";
+            break;
+        }
+        int size[2] = { 0, 0 };
+        if (screen_get_window_property_iv(windowHandle, SCREEN_PROPERTY_SIZE, size) != 0 || size[0] <= 0
+                || size[1] <= 0 || size[0] > 4096 || size[1] > 4096) {
+            note = QString("window size unknown (%1 x %2)").arg(size[0]).arg(size[1]);
+            break;
+        }
+        static screen_context_t captureContext = 0;
+        if (!captureContext && screen_create_context(&captureContext, SCREEN_APPLICATION_CONTEXT) != 0) {
+            captureContext = 0;
+            note = "no screen context";
+            break;
+        }
+        if (screen_create_pixmap(&pix, captureContext) != 0) {
+            note = "could not create a pixmap";
+            break;
+        }
+        havePix = true;
+        int format = SCREEN_FORMAT_RGBA8888;
+        int usage = SCREEN_USAGE_READ | SCREEN_USAGE_NATIVE;
+        screen_set_pixmap_property_iv(pix, SCREEN_PROPERTY_FORMAT, &format);
+        screen_set_pixmap_property_iv(pix, SCREEN_PROPERTY_USAGE, &usage);
+        screen_set_pixmap_property_iv(pix, SCREEN_PROPERTY_BUFFER_SIZE, size);
+        if (screen_create_pixmap_buffer(pix) != 0) {
+            note = "could not create the pixmap buffer";
+            break;
+        }
+        screen_buffer_t buf = 0;
+        screen_get_pixmap_property_pv(pix, SCREEN_PROPERTY_RENDER_BUFFERS, (void **) &buf);
+        if (!buf) {
+            note = "no pixmap render buffer";
+            break;
+        }
+        int rect[4] = { 0, 0, size[0], size[1] };
+        if (screen_read_window(windowHandle, buf, 1, rect, 0) != 0) {
+            note = QString("screen_read_window failed (errno %1)").arg(errno);
+            break;
+        }
+        void *ptr = 0;
+        int stride = 0;
+        screen_get_buffer_property_pv(buf, SCREEN_PROPERTY_POINTER, &ptr);
+        screen_get_buffer_property_iv(buf, SCREEN_PROPERTY_STRIDE, &stride);
+        if (!ptr || stride < size[0] * 4) {
+            note = "the pixmap buffer cannot be accessed";
+            break;
+        }
+        const unsigned char *src = (const unsigned char *) ptr;
+        if (pictureLooksBlank(src, size[0], size[1], stride)) {
+            note = QString("the window (%1 x %2) reads as black").arg(size[0]).arg(size[1]);
+            break;
+        }
+        // Keep it small (it is only shown for a second or two): every step-th pixel, rows and columns.
+        int step = (size[0] > 800) ? size[0] / 640 : 1;
+        if (step < 1) step = 1;
+        int outW = size[0] / step;
+        int outH = size[1] / step;
+        bb::ImageData out(bb::PixelFormat::RGBX, outW, outH);
+        unsigned char *dst = out.pixels();
+        int dstStride = out.bytesPerLine();
+        for (int y = 0; y < outH; y++) {
+            const unsigned char *row = src + (y * step) * stride;
+            unsigned char *d = dst + y * dstStride;
+            for (int x = 0; x < outW; x++) {
+                const unsigned char *p = row + (x * step) * 4;
+#if SCREEN_PIXELS_ARE_BGRA
+                d[0] = p[2];
+                d[1] = p[1];
+                d[2] = p[0];
+#else
+                d[0] = p[0];
+                d[1] = p[1];
+                d[2] = p[2];
+#endif
+                d[3] = 255;
+                d += 4;
+            }
+        }
+        result = out;
+        const unsigned char *c = src + (size[1] / 2) * stride + (size[0] / 2) * 4;
+        note = QString("ok, window %1 x %2, image %3 x %4, centre pixel bytes %5 %6 %7 %8").arg(size[0]).arg(size[1])
+                .arg(outW).arg(outH).arg(int(c[0])).arg(int(c[1])).arg(int(c[2])).arg(int(c[3]));
+    } while (false);
+    if (havePix) screen_destroy_pixmap(pix);
+    if (info) *info = QString("%1 (%2 ms)").arg(note).arg(perf.elapsed());
+    return result;
+}
+
+void GlobalPlayerContext::stopForNewVideo()
+{
+    // setMetadata() has already stored the old video's viewed percent. Without
+    // this the old video went on playing -- under the new title -- until the
+    // first file of the new one was ready (over a minute on a slow relay).
+    qDebug() << "[bbtube][player] stopping the previous video: position" << mediaPlayer->position() / 1000.0
+             << "s, state" << (int) mediaPlayer->mediaState();
+    mediaPlayer->stop();
+    partialSource = false;
+    positionOffsetMs = 0;
+    fullDurationMs = 0;
+    seekIntercept = false;
 }
 void GlobalPlayerContext::acquire()
 {

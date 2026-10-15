@@ -18,9 +18,10 @@ InvidiousClient::InvidiousClient(InvidiousInstanceManager *instanceManager, QObj
 {
 }
 
-void InvidiousClient::fetchVideo(const QString &videoId)
+void InvidiousClient::fetchVideo(const QString &videoId, const QStringList &exclude)
 {
-    QString instanceBaseUrl = instanceManager->pickRandomInstance();
+    excludedInstances = exclude;
+    QString instanceBaseUrl = instanceManager->pickRandomInstance(excludedInstances);
     if (instanceBaseUrl.isEmpty()) {
         emit error("No Invidious instance available");
         return;
@@ -156,7 +157,7 @@ void InvidiousClient::onVideoRequestFinished()
                   << (networkOk ? "" : QString("(network error: %1)").arg(reply->errorString()));
 
         if (attemptNumber < MAX_INSTANCE_ATTEMPTS) {
-            QString nextInstance = instanceManager->pickRandomInstance();
+            QString nextInstance = instanceManager->pickRandomInstance(excludedInstances);
             if (!nextInstance.isEmpty()) {
                 qDebug() << "[bbtube][invidious] retrying with instance:" << nextInstance;
                 requestFromInstance(videoId, nextInstance, attemptNumber + 1);

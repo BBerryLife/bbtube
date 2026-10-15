@@ -32,10 +32,19 @@ static const int MAX_INFLIGHT = 6;
 // Range requests, each at least MIN_PART_BYTES long.
 static const int MAX_PARTS = 4;
 static const qint64 MIN_PART_BYTES = 96 * 1024;
+// Whole-fragment requests: on a relay with seconds of latency per request,
+// fewer and bigger requests download much faster (simulated: 61s -> 44s for
+// 90s of video at 3s latency); the first two chunks keep the small parts so
+// that playback can start as early as possible.
+static const qint64 FRAG_PART_BYTES = 192 * 1024;
+static const int FRAG_SMALL_PARTS_UNTIL_STORED = 2;
 // How many chunks past the last appended one may be in progress at once
 // (their buffers live in RAM: ~1MB per 5s of 720p).
 static const size_t CHUNK_WINDOW = 3;
 static const int MAX_RETRIES = 5;
+// The heads are the first request to the stream host. A dead or very slow host used to keep the video from
+// starting for up to 57 s (6 attempts x 9 s) before another instance was tried; now it is ~14 s at most.
+static const int HEAD_MAX_RETRIES = 1;
 // Retry delays grow 0.4s, 0.8s, 1.6s, 3.2s, 5s: a relay answering 5xx to
 // everything used to be hammered ~3 times a second by up to 8 requests, which
 // on this CPU was enough to starve the player.
@@ -49,6 +58,11 @@ static const int MAX_INFLIGHT_RELAXED = 3;
 static const int MAX_VERIFY_RETRIES = 6;
 static const int RETRY_DELAY_MS = 400; // see StreamingRemuxSession for why delayed + Connection: close
 static const qint64 MERGE_SLICE_BYTES = 1024 * 1024;
+// A fragment up to this size is fetched whole (moof + media data in one round
+// of requests, see queueFragJobs); bigger ones keep the old moof-then-body
+// scheme so RAM use stays bounded.
+static const qint64 FRAG_FETCH_MAX_BYTES = 6 * 1024 * 1024;
+static const int STATS_INTERVAL_MS = 5000;
 
 static Mp4RemuxBytes toBytes(const QByteArray &a)
 {
@@ -99,11 +113,15 @@ static qint64 buildRunParts(const std::vector<FragSample> &s, size_t i0, size_t 
     return bufOff;
 }
 
-static const int STALL_MS = 6000; // a request that has received nothing for this long is aborted and retried
+static const int STALL_MS = 6000; // a request that stopped receiving data for this long is aborted and retried
+// A relay may need many seconds before the first byte of a range (it opens its own upstream
+// connection first). Aborting at 6s threw that work away and started the wait again: one
+// slow instance logged 85 aborts, and one fragment was aborted five times in a row.
+static const int STALL_FIRST_BYTE_MS = 15000;
 static const int HEDGE_MS = 4000; // the chunk the player needs next: duplicate requests older than this
 static const int HEDGE_IDLE_MS = 2500; // ...and has received nothing for this long
 static const int WATCHDOG_MS = 1000;
-static const int HEAD_TIMEOUT_MS = 8000;
+static const int HEAD_TIMEOUT_MS = 7000;
 static const int MAX_HEDGE_EXTRA = 3; // hedged duplicates may exceed MAX_INFLIGHT by this many
 
 ChunkedRemuxSession::ChunkedRemuxSession(QNetworkAccessManager *networkManager,
@@ -120,6 +138,13 @@ ChunkedRemuxSession::ChunkedRemuxSession(QNetworkAccessManager *networkManager,
                 0), m_mergeFinal(false), m_mergeOut(0), m_mergeAin(0), m_mergeVin(0), m_mergeASegIdx(
                 0), m_mergeVSegIdx(0), m_mergeSegLeft(0), m_mergeSegOpen(false)
 {
+    m_statBytes = 0;
+    m_statTtfbSum = 0;
+    m_statReqs = 0;
+    m_statTtfbN = 0;
+    m_statRetries = 0;
+    m_statClock.start();
+    m_mergeNextMax = 0;
     m_watchdog = new QTimer(this);
     QObject::connect(m_watchdog, SIGNAL(timeout()), this, SLOT(onWatchdog()));
     m_retryTimer = new QTimer(this);
@@ -213,7 +238,7 @@ void ChunkedRemuxSession::onHeadFinished()
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        if (retries < MAX_RETRIES) {
+        if (retries < HEAD_MAX_RETRIES) {
             retries++;
             qDebug() << "[bbtube][chunk]" << label << "head fetch failed (" << msg << ") - retry"
                      << retries;
@@ -330,6 +355,14 @@ void ChunkedRemuxSession::onHeadsReady()
     m_aFragState.assign(nA, 0);
     m_vFragSamples.resize(nV);
     m_aFragSamples.resize(nA);
+    m_vFragBuf.assign(nV, QByteArray());
+    m_aFragBuf.assign(nA, QByteArray());
+    m_vFragPending.assign(nV, 0);
+    m_aFragPending.assign(nA, 0);
+    m_vFragCached.assign(nV, 0);
+    m_aFragCached.assign(nA, 0);
+    m_vFragLegacy.assign(nV, 0);
+    m_aFragLegacy.assign(nA, 0);
 
     for (size_t k = 0; k < plan.size(); k++) {
         Chunk c;
@@ -362,6 +395,7 @@ void ChunkedRemuxSession::onHeadsReady()
     double startAt = m_pendingSeekSec >= 0 ? m_pendingSeekSec : m_startAtSeconds;
     m_pendingSeekSec = -1;
     m_head = chunkIndexAt(startAt);
+    qDebug() << "[bbtube][net] request types: 0 moof video, 1 moof audio, 2 body video, 3 body audio, 4 whole fragment video, 5 whole fragment audio";
     qDebug() << "[bbtube][chunk] heads ready after" << m_clock.elapsed() << "ms:" << qint64(m_chunks.size())
              << "chunks of ~" << m_chunkSeconds << "s, total" << m_totalSeconds << "s, starting at chunk"
              << m_head << "(" << startAt << "s)";
@@ -504,6 +538,9 @@ void ChunkedRemuxSession::abortUnstoredWork()
 
     for (size_t f = 0; f < m_vFragState.size(); f++) if (m_vFragState[f] == 1) m_vFragState[f] = 0;
     for (size_t f = 0; f < m_aFragState.size(); f++) if (m_aFragState[f] == 1) m_aFragState[f] = 0;
+    // Half-fetched fragments are dropped; complete cached ones too (their
+    // parsed samples stay, the bytes are simply fetched again if still needed).
+    dropAllFragCaches();
     for (size_t k = 0; k < m_chunks.size(); k++) {
         Chunk &c = m_chunks[k];
         if (c.state != 1) continue;
@@ -528,6 +565,51 @@ void ChunkedRemuxSession::queueJob(Job *job)
     m_queue.append(job);
 }
 
+void ChunkedRemuxSession::dropAllFragCaches()
+{
+    for (size_t f = 0; f < m_vFragBuf.size(); f++) {
+        m_vFragBuf[f] = QByteArray();
+        m_vFragPending[f] = 0;
+        m_vFragCached[f] = 0;
+    }
+    for (size_t f = 0; f < m_aFragBuf.size(); f++) {
+        m_aFragBuf[f] = QByteArray();
+        m_aFragPending[f] = 0;
+        m_aFragCached[f] = 0;
+    }
+}
+
+// Splits the whole fragment [offset, offset + referencedSize) into at most
+// MAX_PARTS parallel range requests. The first part holds the moof, so the
+// fragment can be parsed as soon as everything has arrived -- there is no
+// separate (latency-bound) moof round trip any more.
+void ChunkedRemuxSession::queueFragJobs(bool isVideo, size_t f, int chunk)
+{
+    qint64 start = qint64(isVideo ? m_vFragOffset[f] : m_aFragOffset[f]);
+    qint64 size = qint64(
+            isVideo ? m_videoHead.sidx.entries[f].referencedSize : m_audioHead.sidx.entries[f].referencedSize);
+    QByteArray &buf = isVideo ? m_vFragBuf[f] : m_aFragBuf[f];
+    buf = QByteArray(int(size), 0);
+    qint64 minPart = (m_storedCount < FRAG_SMALL_PARTS_UNTIL_STORED) ? MIN_PART_BYTES : FRAG_PART_BYTES;
+    int parts = int(size / minPart);
+    if (parts < 1) parts = 1;
+    if (parts > MAX_PARTS) parts = MAX_PARTS;
+    (isVideo ? m_vFragPending[f] : m_aFragPending[f]) = parts;
+    qint64 base = size / parts;
+    qint64 off = 0;
+    for (int p = 0; p < parts; p++) {
+        Job *j = new Job();
+        j->type = isVideo ? JobFragVideo : JobFragAudio;
+        j->chunk = chunk;
+        j->frag = f;
+        j->start = start + off;
+        j->len = (p == parts - 1) ? (size - off) : base;
+        j->bufOffset = off;
+        off += j->len;
+        queueJob(j);
+    }
+}
+
 void ChunkedRemuxSession::scheduleDiscovery(size_t k)
 {
     Chunk &c = m_chunks[k];
@@ -536,6 +618,11 @@ void ChunkedRemuxSession::scheduleDiscovery(size_t k)
     for (size_t f = c.fragStart; f < c.fragEnd; f++) {
         if (m_vFragState[f] != 0) continue;
         m_vFragState[f] = 1;
+        qint64 size = qint64(m_videoHead.sidx.entries[f].referencedSize);
+        if (!m_vFragLegacy[f] && size > 0 && size <= FRAG_FETCH_MAX_BYTES) {
+            queueFragJobs(true, f, int(k));
+            continue;
+        }
         Job *j = new Job();
         j->type = JobMoofVideo;
         j->chunk = int(k);
@@ -547,6 +634,11 @@ void ChunkedRemuxSession::scheduleDiscovery(size_t k)
     for (size_t f = c.aFragStart; f < c.aFragEnd; f++) {
         if (m_aFragState[f] != 0) continue;
         m_aFragState[f] = 1;
+        qint64 size = qint64(m_audioHead.sidx.entries[f].referencedSize);
+        if (!m_aFragLegacy[f] && size > 0 && size <= FRAG_FETCH_MAX_BYTES) {
+            queueFragJobs(false, f, int(k));
+            continue;
+        }
         Job *j = new Job();
         j->type = JobMoofAudio;
         j->chunk = int(k);
@@ -610,6 +702,10 @@ void ChunkedRemuxSession::assemble(size_t k)
 void ChunkedRemuxSession::queueVideoBodyJobs(size_t k)
 {
     Chunk &c = m_chunks[k];
+    if (c.verifyRetries == 0 && fillFromFragCache(k, true)) {
+        c.vPending = 0; // the whole fragment was already downloaded
+        return;
+    }
     std::vector<RunPart> parts;
     // After a failed structure check, refetch as ONE request: every extra
     // parallel request is another chance for the relay to answer with wrong
@@ -632,6 +728,10 @@ void ChunkedRemuxSession::queueVideoBodyJobs(size_t k)
 void ChunkedRemuxSession::queueAudioBodyJobs(size_t k)
 {
     Chunk &c = m_chunks[k];
+    if (c.verifyRetries == 0 && fillFromFragCache(k, false)) {
+        c.aPending = 0;
+        return;
+    }
     std::vector<RunPart> parts;
     qint64 bytes = buildRunParts(c.aSamples, 0, c.aSamples.size(), &parts, MAX_PARTS);
     c.aBuf = QByteArray(int(bytes), 0);
@@ -653,7 +753,93 @@ void ChunkedRemuxSession::queueBodyJobs(size_t k)
     queueAudioBodyJobs(k);
     Chunk &c = m_chunks[k];
     if (c.vPending == 0 && c.aPending == 0) {
-        onChunkBuffersComplete(k); // degenerate: nothing to download
+        // Everything came from the fragment cache (or there is nothing to
+        // download). Completed from the event loop, not from inside pump():
+        // storing a chunk emits progress(), whose receivers may call back in.
+        QMetaObject::invokeMethod(this, "completeChunkDeferred", Qt::QueuedConnection, Q_ARG(int, int(k)));
+    }
+}
+
+void ChunkedRemuxSession::completeChunkDeferred(int k)
+{
+    if (m_cancelled || m_failed || k < 0 || k >= int(m_chunks.size())) return;
+    Chunk &c = m_chunks[size_t(k)];
+    if (c.state != 1 || !c.assembled || c.ready || c.vPending != 0 || c.aPending != 0) return;
+    onChunkBuffersComplete(size_t(k));
+    pump();
+}
+
+// Copies the chunk's sample payloads out of the cached whole fragments (same
+// layout buildRunParts() describes: payloads back to back, in sample order).
+// Returns false -- touching nothing -- when any needed fragment is not cached.
+bool ChunkedRemuxSession::fillFromFragCache(size_t k, bool isVideo)
+{
+    Chunk &c = m_chunks[k];
+    const std::vector<FragSample> &samples = isVideo ? c.vSamples : c.aSamples;
+    const std::vector<uint64_t> &offs = isVideo ? m_vFragOffset : m_aFragOffset;
+    const std::vector<QByteArray> &bufs = isVideo ? m_vFragBuf : m_aFragBuf;
+    const std::vector<char> &cached = isVideo ? m_vFragCached : m_aFragCached;
+    size_t f0 = isVideo ? c.fragStart : c.aFragStart;
+    size_t f1 = isVideo ? c.fragEnd : c.aFragEnd;
+
+    std::vector<size_t> where(samples.size(), 0);
+    qint64 total = 0;
+    for (size_t i = 0; i < samples.size(); i++) {
+        bool found = false;
+        for (size_t f = f0; f < f1; f++) {
+            uint64_t base = offs[f];
+            if (samples[i].offsetInSource < base) continue;
+            uint64_t rel = samples[i].offsetInSource - base;
+            if (rel + samples[i].size > uint64_t(bufs[f].size())) continue;
+            if (!cached[f]) return false;
+            where[i] = f;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+        total += samples[i].size;
+    }
+    QByteArray out(int(total), 0);
+    qint64 pos = 0;
+    for (size_t i = 0; i < samples.size(); i++) {
+        size_t f = where[i];
+        uint64_t rel = samples[i].offsetInSource - offs[f];
+        std::memcpy(out.data() + pos, bufs[f].constData() + rel, samples[i].size);
+        pos += samples[i].size;
+    }
+    if (isVideo) {
+        c.vBuf = out;
+        // A video fragment belongs to exactly one chunk: free it right away.
+        for (size_t f = f0; f < f1; f++) {
+            m_vFragBuf[f] = QByteArray();
+            m_vFragCached[f] = 0;
+        }
+    } else {
+        c.aBuf = out;
+    }
+    return true;
+}
+
+// An audio fragment can serve two neighbouring chunks: it is released once
+// every chunk that needs it has been stored.
+void ChunkedRemuxSession::releaseFragCaches(size_t k)
+{
+    const Chunk &c = m_chunks[k];
+    for (size_t j = c.aFragStart; j < c.aFragEnd; j++) {
+        if (!m_aFragCached[j]) continue;
+        bool needed = false;
+        for (size_t i = 0; i < m_chunks.size(); i++) {
+            const Chunk &o = m_chunks[i];
+            if (o.aFragStart > j) break;
+            if (j < o.aFragEnd && o.state != 2) {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) {
+            m_aFragBuf[j] = QByteArray();
+            m_aFragCached[j] = 0;
+        }
     }
 }
 
@@ -719,7 +905,7 @@ void ChunkedRemuxSession::pump()
 
 void ChunkedRemuxSession::dispatch(Job *job)
 {
-    bool isVideo = (job->type == JobMoofVideo || job->type == JobBodyVideo);
+    bool isVideo = (job->type == JobMoofVideo || job->type == JobBodyVideo || job->type == JobFragVideo);
     QNetworkRequest req(QUrl::fromEncoded((isVideo ? m_videoUrl : m_audioUrl).toUtf8()));
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(job->start) + "-"
@@ -739,11 +925,13 @@ void ChunkedRemuxSession::dispatch(Job *job)
 
 void ChunkedRemuxSession::onJobProgress(qint64 received, qint64 total)
 {
-    Q_UNUSED(received);
     Q_UNUSED(total);
     QNetworkReply *reply = qobject_cast<QNetworkReply *>(QObject::sender());
     Job *job = m_inflight.value(reply, 0);
-    if (job) job->lastActivity.start();
+    if (job) {
+        job->lastActivity.start();
+        if (received > 0 && job->firstByteMs < 0) job->firstByteMs = job->startedAt.elapsed();
+    }
 }
 
 // Removes a job that is either in flight or still queued, and frees it.
@@ -786,6 +974,21 @@ void ChunkedRemuxSession::onJobFinished()
     QByteArray data = reply->readAll();
     reply->deleteLater();
 
+    {
+        int totalMs = job->startedAt.elapsed();
+        int ttfb = job->firstByteMs >= 0 ? job->firstByteMs : totalMs;
+        int xferMs = totalMs - ttfb;
+        m_statBytes += data.size();
+        m_statReqs++;
+        m_statTtfbSum += ttfb;
+        m_statTtfbN++;
+        qDebug() << "[bbtube][net] type" << job->type << "chunk" << job->chunk << "got" << data.size() / 1024
+                 << "KB: first byte after" << ttfb << "ms, complete after" << totalMs << "ms"
+                 << qPrintable(xferMs > 50 ? QString("(%1 KB/s while receiving)").arg(data.size() * 1000.0 / xferMs / 1024.0, 0, 'f', 0) : QString("(instant)"))
+                 << "- in flight" << m_inflight.size() << ", queued" << m_queue.size()
+                 << (job->twin ? "raced" : "") << (job->retries > 0 ? "was retried" : "");
+    }
+
     // This request won the race against its hedged twin: the twin is dropped.
     if (job->twin) {
         Job *t = job->twin;
@@ -796,6 +999,8 @@ void ChunkedRemuxSession::onJobFinished()
 
     if (job->type == JobMoofVideo || job->type == JobMoofAudio) {
         handleMoof(job, data);
+    } else if (job->type == JobFragVideo || job->type == JobFragAudio) {
+        handleFrag(job, data);
     } else {
         handleBody(job, data);
     }
@@ -813,6 +1018,7 @@ void ChunkedRemuxSession::retryJob(Job *job, const QString &why)
     }
     if (job->retries < MAX_RETRIES) {
         job->retries++;
+        m_statRetries++;
         int delay = RETRY_DELAY_MS << (job->retries - 1);
         if (delay > RETRY_MAX_DELAY_MS) delay = RETRY_MAX_DELAY_MS;
         job->retryAt = m_clock.elapsed() + delay;
@@ -854,6 +1060,7 @@ void ChunkedRemuxSession::onRetryTimer()
 void ChunkedRemuxSession::onWatchdog()
 {
     if (m_cancelled || m_failed) return;
+    logNetStats();
 
     if (m_videoHeadReply && m_videoHeadClock.elapsed() > HEAD_TIMEOUT_MS) m_videoHeadReply->abort();
     if (m_audioHeadReply && m_audioHeadClock.elapsed() > HEAD_TIMEOUT_MS) m_audioHeadReply->abort();
@@ -863,7 +1070,8 @@ void ChunkedRemuxSession::onWatchdog()
     for (int i = 0; i < replies.size(); i++) {
         if (m_cancelled || m_failed) return;
         Job *j = m_inflight.value(replies[i], 0);
-        if (j && j->lastActivity.elapsed() > STALL_MS) {
+        int limit = (j && j->firstByteMs < 0) ? STALL_FIRST_BYTE_MS : STALL_MS;
+        if (j && j->lastActivity.elapsed() > limit) {
             qDebug() << "[bbtube][chunk] request type" << j->type << "chunk" << j->chunk << "stalled for"
                      << j->lastActivity.elapsed() << "ms - aborting";
             replies[i]->abort(); // -> onJobFinished with an error -> retry
@@ -908,6 +1116,35 @@ void ChunkedRemuxSession::onWatchdog()
     }
 }
 
+// One line every few seconds: download speed, latency, queue depth and how far
+// ahead of the playhead the stored data reaches -- enough to tell a slow relay
+// from a slow app from a player that simply ran out.
+void ChunkedRemuxSession::logNetStats()
+{
+    int ms = m_statClock.elapsed();
+    if (ms < STATS_INTERVAL_MS) return;
+    m_statClock.start();
+    double ahead = -1.0;
+    if (m_headsDone && m_playheadSec >= 0 && !m_chunks.empty()) {
+        int k = chunkIndexAt(m_playheadSec);
+        if (isChunkStored(k)) {
+            ahead = chunkEndSeconds(runEnd(k) - 1) - m_playheadSec;
+        } else {
+            ahead = 0.0;
+        }
+    }
+    qDebug() << "[bbtube][net] last" << ms / 1000.0 << "s:" << qint64(m_statBytes * 1000.0 / ms / 1024.0) << "KB/s,"
+             << m_statReqs << "requests, avg first byte" << (m_statTtfbN ? qint64(m_statTtfbSum / m_statTtfbN) : 0)
+             << "ms," << m_statRetries << "retries; in flight" << m_inflight.size() << ", queued" << m_queue.size()
+             << "; stored" << m_storedCount << "of" << qint64(m_chunks.size()) << ", head" << m_head
+             << ", playhead" << m_playheadSec << "s, stored data runs" << ahead << "s past it";
+    m_statBytes = 0;
+    m_statReqs = 0;
+    m_statTtfbSum = 0;
+    m_statTtfbN = 0;
+    m_statRetries = 0;
+}
+
 void ChunkedRemuxSession::handleMoof(Job *job, const QByteArray &data)
 {
     bool isVideo = (job->type == JobMoofVideo);
@@ -932,6 +1169,72 @@ void ChunkedRemuxSession::handleMoof(Job *job, const QByteArray &data)
         } else {
             retryJob(job, QString("moof parse failed: %1").arg(e.what()));
         }
+    }
+}
+
+void ChunkedRemuxSession::handleFrag(Job *job, const QByteArray &data)
+{
+    if (qint64(data.size()) != job->len) {
+        retryJob(job, QString("size mismatch: expected %1 got %2").arg(job->len).arg(data.size()));
+        return;
+    }
+    bool isVideo = (job->type == JobFragVideo);
+    size_t f = job->frag;
+    QByteArray &buf = isVideo ? m_vFragBuf[f] : m_aFragBuf[f];
+    int &pending = isVideo ? m_vFragPending[f] : m_aFragPending[f];
+    int state = isVideo ? m_vFragState[f] : m_aFragState[f];
+    if (state != 1 || pending <= 0 || job->bufOffset + job->len > qint64(buf.size())) {
+        delete job; // the fragment was reset meanwhile (seek / source change)
+        return;
+    }
+    std::memcpy(buf.data() + job->bufOffset, data.constData(), size_t(data.size()));
+    pending--;
+    int chunk = job->chunk;
+    delete job;
+    if (pending == 0) finalizeFrag(isVideo, f, chunk);
+}
+
+// All parts of a whole fragment have arrived: read its moof, keep the bytes.
+// Anything odd (moof larger than expected, samples pointing outside the
+// fragment, a relay that returned wrong bytes) falls back to the classic
+// moof-then-body requests for this fragment, which have their own checks.
+void ChunkedRemuxSession::finalizeFrag(bool isVideo, size_t f, int chunk)
+{
+    QByteArray &buf = isVideo ? m_vFragBuf[f] : m_aFragBuf[f];
+    uint64_t base = isVideo ? m_vFragOffset[f] : m_aFragOffset[f];
+    try {
+        int headLen = int(qMin(qint64(buf.size()), MOOF_FETCH_MAX_BYTES));
+        std::vector<FragSample> s = parseMoofSamples(toBytes(buf.left(headLen)), size_t(base),
+                isVideo ? "video" : "audio");
+        if (s.empty()) throw std::runtime_error("moof describes no samples");
+        uint64_t end = base + uint64_t(buf.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i].offsetInSource < base || s[i].offsetInSource + s[i].size > end) {
+                throw std::runtime_error("a sample lies outside its fragment");
+            }
+        }
+        if (isVideo) {
+            m_vFragSamples[f] = s;
+            m_vFragState[f] = 2;
+            m_vFragCached[f] = 1;
+        } else {
+            m_aFragSamples[f] = s;
+            m_aFragState[f] = 2;
+            m_aFragCached[f] = 1;
+        }
+    } catch (const std::exception &e) {
+        qDebug() << "[bbtube][chunk]" << (isVideo ? "video" : "audio") << "fragment" << qint64(f)
+                 << "could not be read as a whole (" << e.what() << ") - using separate moof/body requests";
+        buf = QByteArray();
+        (isVideo ? m_vFragLegacy[f] : m_aFragLegacy[f]) = 1;
+        (isVideo ? m_vFragCached[f] : m_aFragCached[f]) = 0;
+        Job *j = new Job();
+        j->type = isVideo ? JobMoofVideo : JobMoofAudio;
+        j->chunk = chunk;
+        j->frag = f;
+        j->start = qint64(base);
+        j->len = MOOF_FETCH_BYTES;
+        queueJob(j);
     }
 }
 
@@ -1029,7 +1332,9 @@ void ChunkedRemuxSession::storeChunk(size_t k)
     c.vBuf = QByteArray();
     c.aBuf = QByteArray();
     c.state = 2;
+    releaseFragCaches(k);
     m_storedCount++;
+    m_storedLog.push_back(std::make_pair(qint64(m_clock.elapsed()), chunkEndSeconds(int(k)) - chunkStartSeconds(int(k))));
     if (int(k) == m_head) {
         int next = firstMissingFrom(int(k) + 1 < int(m_chunks.size()) ? int(k) + 1 : 0);
         if (next >= 0) m_head = next;
@@ -1045,11 +1350,41 @@ void ChunkedRemuxSession::storeChunk(size_t k)
 // ---------------------------------------------------------------------------
 // Merging
 // ---------------------------------------------------------------------------
-void ChunkedRemuxSession::requestMerge(int startChunk)
+double ChunkedRemuxSession::recentRatio(int windowMs) const
+{
+    if (m_storedLog.size() < 4) return -1.0;
+    qint64 now = m_clock.elapsed();
+    qint64 from = now - windowMs;
+    qint64 first = m_storedLog.front().first;
+    if (from < first) from = first; // a short history: measure from the first chunk
+    double secs = 0.0;
+    int n = 0;
+    for (size_t i = 0; i < m_storedLog.size(); i++) {
+        if (m_storedLog[i].first > from) {
+            secs += m_storedLog[i].second;
+            n++;
+        }
+    }
+    double wall = (now - from) / 1000.0;
+    if (n < 2 || wall < 5.0) return -1.0;
+    return secs / wall;
+}
+
+qint64 ChunkedRemuxSession::stagedBytes(int startChunk, int endChunk) const
+{
+    qint64 total = 0;
+    if (startChunk < 0) startChunk = 0;
+    if (endChunk > int(m_chunks.size())) endChunk = int(m_chunks.size());
+    for (int k = startChunk; k < endChunk; k++) total += m_chunks[k].vLen + m_chunks[k].aLen;
+    return total;
+}
+
+void ChunkedRemuxSession::requestMerge(int startChunk, qint64 maxBytes)
 {
     if (m_cancelled || !m_headsDone || !m_vStage || !m_aStage) return;
     if (!isChunkStored(startChunk)) return;
     m_mergeNextStart = startChunk;
+    m_mergeNextMax = maxBytes;
     if (!m_mergeActive) {
         startNextMerge();
     }
@@ -1070,9 +1405,23 @@ void ChunkedRemuxSession::closeMergeFiles(bool removePartial)
 void ChunkedRemuxSession::startNextMerge()
 {
     int a = m_mergeNextStart;
+    qint64 cap = m_mergeNextMax;
     m_mergeNextStart = -1;
+    m_mergeNextMax = 0;
     if (!isChunkStored(a)) return;
     int b = runEnd(a);
+    if (cap > 0) {
+        // At least one chunk, then as many as fit under the cap.
+        int e = a;
+        qint64 acc = 0;
+        while (e < b) {
+            qint64 add = m_chunks[e].vLen + m_chunks[e].aLen;
+            if (e > a && acc + add > cap) break;
+            acc += add;
+            e++;
+        }
+        b = e;
+    }
 
     TrackHead v = m_videoHead;
     TrackHead au = m_audioHead;

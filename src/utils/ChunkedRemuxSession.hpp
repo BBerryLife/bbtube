@@ -76,11 +76,20 @@ public:
 
     // Builds a merged file for the run of stored chunks that begins at
     // startChunk (which must be stored). Async; result via mergedReady().
-    void requestMerge(int startChunk);
+    // maxBytes > 0 caps the size of the merged file (media data only); the file then ends earlier than the
+    // stored run does. Copying a file that grows with the whole video made the player stall on slow flash.
+    void requestMerge(int startChunk, qint64 maxBytes = 0);
+    // Seconds of media stored per second of wall time over the last windowMs (>1: the source is faster than
+    // playback); -1 until a few chunks have arrived.
+    double recentRatio(int windowMs) const;
+    // Give up on a source that answers too slowly; emits sourceFailing() like a failing one.
+    void abandonSlowSource(const QString &reason) { pauseForNewSource(reason); }
+    qint64 stagedBytes(int startChunk, int endChunk) const; // media bytes of the stored chunks [start, end)
 
     // --- queries (valid once heads are ready; see headsReady()) ---
     bool headsReady() const { return m_headsDone; }
     int chunkCount() const { return int(m_chunks.size()); }
+    int inflightCount() const { return m_inflight.size(); }
     int chunkIndexAt(double absSeconds) const;
     double chunkStartSeconds(int k) const;
     double chunkEndSeconds(int k) const;
@@ -120,9 +129,12 @@ private slots:
     void onMergeStep();
     void onCacheHitTimer();
     void onWatchdog();
+    void completeChunkDeferred(int k);
 
 private:
-    enum JobType { JobMoofVideo, JobMoofAudio, JobBodyVideo, JobBodyAudio };
+    // Numbers shown as "type" in the log: 0 moof video, 1 moof audio, 2 body video,
+    // 3 body audio, 4 whole fragment video, 5 whole fragment audio.
+    enum JobType { JobMoofVideo, JobMoofAudio, JobBodyVideo, JobBodyAudio, JobFragVideo, JobFragAudio };
 
     struct Job
     {
@@ -137,8 +149,9 @@ private:
         QTime startedAt;
         QTime lastActivity;
         qint64 retryAt; // m_clock ms at which a failed request may be re-queued
+        int firstByteMs; // ms after dispatch at which data first arrived (-1: nothing yet)
         Job *twin; // hedged duplicate of the same request (first to finish wins)
-        Job() : type(0), chunk(0), frag(0), start(0), len(0), bufOffset(0), retries(0), reply(0), retryAt(0), twin(0) {}
+        Job() : type(0), chunk(0), frag(0), start(0), len(0), bufOffset(0), retries(0), reply(0), retryAt(0), firstByteMs(-1), twin(0) {}
     };
 
     struct Chunk
@@ -176,6 +189,15 @@ private:
     void queueVideoBodyJobs(size_t k);
     void queueAudioBodyJobs(size_t k);
     void queueJob(Job *job);
+    // Whole-fragment fetching: one request round (instead of moof first, then
+    // body) per fragment. The bytes stay cached until the chunk is assembled.
+    void queueFragJobs(bool isVideo, size_t f, int chunk);
+    void handleFrag(Job *job, const QByteArray &data);
+    void finalizeFrag(bool isVideo, size_t f, int chunk);
+    bool fillFromFragCache(size_t k, bool isVideo);
+    void releaseFragCaches(size_t k);
+    void dropAllFragCaches();
+    void logNetStats();
     void pump();
     void dispatch(Job *job);
     void cancelJob(Job *job);
@@ -219,6 +241,11 @@ private:
     std::vector<uint64_t> m_vFragOffset, m_aFragOffset; // absolute moof offsets in the sources
     std::vector<int> m_vFragState, m_aFragState; // 0 none, 1 in flight/queued, 2 done
     std::vector<std::vector<FragSample> > m_vFragSamples, m_aFragSamples; // kept: shared between chunks
+    // Whole-fragment cache (see queueFragJobs): raw fragment bytes until the chunk that needs them has copied its samples.
+    std::vector<QByteArray> m_vFragBuf, m_aFragBuf;
+    std::vector<int> m_vFragPending, m_aFragPending; // parts still missing while a fragment is being fetched
+    std::vector<char> m_vFragCached, m_aFragCached; // buffer holds the complete, parsed fragment
+    std::vector<char> m_vFragLegacy, m_aFragLegacy; // whole-fragment fetch failed once: use moof + body requests
     bool m_sourcePaused;
     double m_playheadSec; // <0: unknown
     bool m_aheadLimited; // pump() declined to start chunks because they are too far ahead of the playhead
@@ -234,6 +261,12 @@ private:
     QTimer *m_watchdog;
     QTimer *m_retryTimer;
 
+    // --- statistics for the log ---
+    qint64 m_statBytes, m_statTtfbSum;
+    int m_statReqs, m_statTtfbN, m_statRetries;
+    QTime m_statClock;
+    std::vector<std::pair<qint64, double> > m_storedLog; // (m_clock ms, video seconds) per stored chunk
+
     // --- staging: payloads of stored chunks, appended in completion order ---
     QFile *m_vStage, *m_aStage;
     qint64 m_vStageBytes, m_aStageBytes;
@@ -241,6 +274,7 @@ private:
     // --- merge ---
     bool m_mergeActive;
     int m_mergeNextStart; // a request that arrived during a merge (-1: none)
+    qint64 m_mergeNextMax; // its size cap (0: none)
     int m_mergeSeq;
     int m_mergeStart, m_mergeCount;
     bool m_mergeFinal;
