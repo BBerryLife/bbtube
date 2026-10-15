@@ -5,6 +5,7 @@
 
 #include <bb/cascades/Page>
 #include <bb/cascades/Container>
+#include <bb/cascades/ScrollView>
 #include <bb/cascades/ToggleButton>
 #include <bb/cascades/Button>
 #include <bb/cascades/TextField>
@@ -32,7 +33,7 @@ SettingsSheet::SettingsSheet() :
     UIConfig *ui = container->ui();
     container->setTopPadding(ui->du(2));
     container->setRightPadding(ui->du(1));
-    container->setBottomPadding(ui->du(1));
+    container->setBottomPadding(ui->du(4)); // extra room so the last button isn't flush with the screen edge
     container->setLeftPadding(ui->du(1));
 
     tabDropdown = DropDown::create().title("Default Tab");
@@ -182,7 +183,13 @@ SettingsSheet::SettingsSheet() :
     titleBar->setAcceptAction(saveAction);
 
     content->setTitleBar(titleBar);
-    content->setContent(container);
+    // The settings list is taller than the screen on small/square devices
+    // (Passport, Classic), so it must scroll -- otherwise the Google login
+    // button at the bottom can't be reached.
+    ScrollView *scrollView = new ScrollView();
+    scrollView->setContent(container);
+
+    content->setContent(scrollView);
     this->setContent(content);
 
     open();

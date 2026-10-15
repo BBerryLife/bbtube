@@ -221,8 +221,8 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/parser/storage/StorageParser.hpp) \
         $$quote($$BASEDIR/src/parser/trending/TrendingPageParser.hpp) \
         $$quote($$BASEDIR/src/settings/AppSettings.hpp) \
-        $$quote($$BASEDIR/src/settings/TrendingRegions.hpp) \
         $$quote($$BASEDIR/src/settings/SettingsSheet.hpp) \
+        $$quote($$BASEDIR/src/settings/TrendingRegions.hpp) \
         $$quote($$BASEDIR/src/utils/ActionItemService.hpp) \
         $$quote($$BASEDIR/src/utils/AudioTrackPicker.hpp) \
         $$quote($$BASEDIR/src/utils/BasePage.hpp) \
