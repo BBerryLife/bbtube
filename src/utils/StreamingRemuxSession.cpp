@@ -5,9 +5,9 @@
 #include <QVariant>
 #include <QTimer>
 
-#ifdef QT_DEBUG
+// Not guarded by QT_DEBUG: several qDebug() calls below are unconditional,
+// and Device-Release builds don't define QT_DEBUG (only Debug/Run does).
 #include <QDebug>
-#endif
 
 // Delay, in ms, before re-issuing a request that just failed with a
 // transient network error (dropped/refused connection, timeout). Retrying
