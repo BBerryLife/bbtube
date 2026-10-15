@@ -31,6 +31,8 @@ public:
     static void setDefautQuality(QString quality);
     static bool isDebugLogToFile();
     static void setDebugLogToFile(bool value);
+    static QString trendingRegion();
+    static void setTrendingRegion(QString value);
     static void runMigrations();
 
     static void createChannel(const ChannelListItemModel *channel);

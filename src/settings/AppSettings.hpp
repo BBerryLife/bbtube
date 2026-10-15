@@ -3,6 +3,7 @@
 
 #include "src/db/DbHelper.hpp"
 #include "src/utils/FileLogger.hpp"
+#include "src/settings/TrendingRegions.hpp"
 
 class AppSettings: public QObject
 {
@@ -16,6 +17,7 @@ public:
         tab = DbHelper::defaultTab();
         quality = DbHelper::defaultQuality();
         debugLogToFile = DbHelper::isDebugLogToFile();
+        trendingRegionCode = DbHelper::trendingRegion();
     }
     ~AppSettings()
     {
@@ -79,7 +81,33 @@ public:
             emit debugLogToFileChanged(value);
         }
     }
+    // Region whose YouTube Charts "Trending" list the Trending tab shows
+    // (lowercase ISO code, always one of TRENDING_REGIONS). Until the user
+    // picks one explicitly this follows the device locale.
+    QString trendingRegion()
+    {
+        if (TrendingRegions::isSupported(trendingRegionCode)) {
+            return trendingRegionCode.toLower();
+        }
+        return TrendingRegions::fromSystemLocale();
+    }
+    void setTrendingRegion(QString value)
+    {
+        value = value.toLower();
+        if (!TrendingRegions::isSupported(value)) {
+            return;
+        }
+        if (trendingRegion() != value || trendingRegionCode != value) {
+            bool changed = (trendingRegion() != value);
+            trendingRegionCode = value;
+            DbHelper::setTrendingRegion(value);
+            if (changed) {
+                emit trendingRegionChanged(value);
+            }
+        }
+    }
 signals:
+    void trendingRegionChanged(QString value);
     void autoplayChanged(bool value);
     void playbackTimeoutChanged(int value);
     void debugLogToFileChanged(bool value);
@@ -89,6 +117,7 @@ private:
     QString tab;
     QString quality;
     bool debugLogToFile;
+    QString trendingRegionCode;
 };
 
 #endif /* APPSETTINGS_HPP_ */

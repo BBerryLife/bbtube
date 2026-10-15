@@ -58,6 +58,17 @@ SettingsSheet::SettingsSheet() :
                         appSettings->defaultQuality() == options[i]));
     }
 
+    trendingRegionDropdown = DropDown::create().title("Trending Region");
+    container->add(trendingRegionDropdown);
+
+    QString currentRegion = appSettings->trendingRegion();
+    for (int i = 0; i < TRENDING_REGIONS_COUNT; i++) {
+        QString code = QString::fromLatin1(TRENDING_REGIONS[i].code);
+        trendingRegionDropdown->add(
+                Option::create().text(QString::fromLatin1(TRENDING_REGIONS[i].name)).value(code).selected(
+                        currentRegion == code));
+    }
+
     Container *autoplayContainer = Container::create();
     StackLayout *autoplayLayout = new StackLayout();
     autoplayLayout->setOrientation(LayoutOrientation::LeftToRight);
@@ -195,6 +206,7 @@ void SettingsSheet::saveActionClick()
     appSettings->setPlaybackTimeout(playbackTimeout);
     appSettings->setDefaultTab(tabDropdown->selectedValue().toString());
     appSettings->setDefaultQuality(qualityDropdown->selectedValue().toString());
+    appSettings->setTrendingRegion(trendingRegionDropdown->selectedValue().toString());
     appSettings->setDebugLogToFile(debugLogButton->isChecked());
 
     closeSheet();

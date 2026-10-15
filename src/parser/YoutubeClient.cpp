@@ -17,6 +17,7 @@
 #include "src/parser/channel/ChannelPageParser.hpp"
 #include "src/parser/recommended/RecommendedPageParser.hpp"
 #include "src/parser/trending/TrendingPageParser.hpp"
+#include "src/settings/TrendingRegions.hpp"
 
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkRequest>
@@ -34,7 +35,7 @@ QMap<QString, ScriptData> YoutubeClient::cachedScripts;
 
 // Current InnerTube client context (WEB client, up-to-date version)
 // UPDATE THIS VERSION periodically - check https://www.youtube.com and search for "INNERTUBE_CLIENT_VERSION"
-static const QString INNERTUBE_CLIENT_VERSION = "2.20240101.00.00";
+static const QString INNERTUBE_CLIENT_VERSION = "2.20260708.00.00"; // matches yt-dlp master "web" client, checked 2026-10-15
 static const QString INNERTUBE_CLIENT_NAME    = "WEB";
 static const QString INNERTUBE_API_URL_BASE   = "https://www.youtube.com/youtubei/v1/";
 
@@ -217,9 +218,15 @@ void YoutubeClient::parse(QString videoId)
 // cipher solving (still unimplemented for the current WEB client's
 // obfuscated player.js, which is a much larger undertaking involving a
 // JS engine -- see yt-dlp's own struggles with this as of 2026).
+static QString computeSapisidHashAt(qint64 timestamp, const QString &sapisid, const QString &origin);
+
 static QString computeSapisidHash(const QString &sapisid, const QString &origin)
 {
-    qint64 timestamp = QDateTime::currentDateTime().toTime_t();
+    return computeSapisidHashAt(QDateTime::currentDateTime().toTime_t(), sapisid, origin);
+}
+
+static QString computeSapisidHashAt(qint64 timestamp, const QString &sapisid, const QString &origin)
+{
     QString toHash = QString("%1 %2 %3").arg(timestamp).arg(sapisid, origin);
     QByteArray toHashUtf8 = toHash.toUtf8();
 
@@ -421,6 +428,10 @@ void YoutubeClient::recommended()
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     applyInnerTubeHeaders(request);
 
+    // The home feed is personalized: without the signed-in session YouTube
+    // only returns a "feed nudge" (no videos). See applyAuthHeaders().
+    bool signedIn = applyAuthHeaders(request);
+
     QString body = QString(
         "{"
         "\"context\":{"
@@ -428,14 +439,16 @@ void YoutubeClient::recommended()
                 "\"clientName\":\"%1\","
                 "\"clientVersion\":\"%2\","
                 "\"hl\":\"en\",\"gl\":\"US\""
-            "}"
+            "},"
+            "\"user\":{\"lockedSafetyMode\":false}"
         "},"
         "\"browseId\":\"FEwhat_to_watch\""
         "}"
     ).arg(INNERTUBE_CLIENT_NAME, INNERTUBE_CLIENT_VERSION);
 
     QNetworkReply *reply = ApplicationUI::networkManager->post(request, body.toUtf8());
-    qDebug() << "[bbtube][recommended] request posted to" << request.url().toString();
+    qDebug() << "[bbtube][recommended] request posted to" << request.url().toString()
+             << ", signedIn =" << signedIn;
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onRecommendedFinished()));
 }
 
@@ -444,6 +457,7 @@ void YoutubeClient::recommendedNextBatch(RecommendedData *recommendedData)
     QNetworkRequest request(INNERTUBE_API_URL_BASE + "browse?key=" + INNERTUBE_API_KEY_WEB + "&prettyPrint=false");
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     applyInnerTubeHeaders(request);
+    applyAuthHeaders(request);
     request.setRawHeader("X-YouTube-Client-Name", "1");
     request.setRawHeader("X-YouTube-Client-Version", recommendedData->clientVersion.toUtf8());
 
@@ -461,17 +475,30 @@ void YoutubeClient::trending(QString categoryKey)
     // As of July 2025, YouTube removed the classic Trending page/browseId
     // (FEtrending) entirely, replacing it with category-specific "Charts"
     // served from a *separate* domain (charts.youtube.com) using a
-    // dedicated InnerTube client ("WEB_MUSIC_ANALYTICS", client id 31) —
+    // dedicated InnerTube client ("WEB_MUSIC_ANALYTICS", client id 31) --
     // captured directly from that page's real network request. categoryKey
     // is now the chart_params_chart_type value (e.g. "TRENDING_VIDEOS",
     // "PODCAST_SHOWS", "MOVIE_TRAILERS"), defaulting to TRENDING_VIDEOS.
+    //
+    // The chart is per-country: the region comes from Settings ->
+    // Trending Region (see AppSettings::trendingRegion()).
     QString chartType = categoryKey.isEmpty() ? "TRENDING_VIDEOS" : categoryKey;
+    QString region = ApplicationUI::appSettings->trendingRegion();
 
-    qDebug() << "[bbtube][trending] trending() called, chartType =" << chartType;
+    requestTrending(chartType, region, false);
+}
+
+// isFallback marks the one automatic retry against the US chart that
+// onTrendingFinished() makes if a region's request is rejected or comes back
+// empty, so a bad region can't loop.
+void YoutubeClient::requestTrending(const QString &chartType, const QString &region, bool isFallback)
+{
+    qDebug() << "[bbtube][trending] requestTrending() chartType =" << chartType
+             << ", region =" << region << ", isFallback =" << isFallback;
 
     QNetworkRequest request(CHARTS_API_URL_BASE + "browse?alt=json");
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    applyChartsHeaders(request);
+    applyChartsHeaders(request, region);
 
     QString body = QString(
         "{"
@@ -480,7 +507,7 @@ void YoutubeClient::trending(QString categoryKey)
             "\"client\":{"
                 "\"clientName\":\"%1\","
                 "\"clientVersion\":\"%2\","
-                "\"hl\":\"en\",\"gl\":\"US\","
+                "\"hl\":\"en\",\"gl\":\"%4\","
                 "\"experimentIds\":[],\"experimentsToken\":\"\","
                 "\"theme\":\"MUSIC\""
             "},"
@@ -489,14 +516,17 @@ void YoutubeClient::trending(QString categoryKey)
         "\"browseId\":\"FEmusic_analytics_charts_home\","
         "\"query\":\"flags=MusicCharts__enable_apac_and_shorts_charts_expansion"
             "&perspective=CHART_DETAILS"
-            "&chart_params_country_code=us"
+            "&chart_params_country_code=%5"
             "&chart_params_chart_type=%3\""
         "}"
-    ).arg(CHARTS_CLIENT_NAME, CHARTS_CLIENT_VERSION, chartType);
+    ).arg(CHARTS_CLIENT_NAME, CHARTS_CLIENT_VERSION, chartType, region.toUpper(), region);
 
     qDebug() << "[bbtube][trending] request body =" << body;
 
     QNetworkReply *reply = ApplicationUI::networkManager->post(request, body.toUtf8());
+    reply->setProperty("chartType", chartType);
+    reply->setProperty("region", region);
+    reply->setProperty("isFallback", isFallback);
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onTrendingFinished()));
 }
 
@@ -925,12 +955,18 @@ void YoutubeClient::onTrendingFinished()
 {
     QNetworkReply *reply = static_cast<QNetworkReply*>(QObject::sender());
 
-    qDebug() << "[bbtube][trending] onTrendingFinished, HTTP status ="
+    QString chartType = reply->property("chartType").toString();
+    QString region = reply->property("region").toString();
+    bool isFallback = reply->property("isFallback").toBool();
+    bool canFallBack = !isFallback && region != TrendingRegions::fallbackCode();
+
+    qDebug() << "[bbtube][trending] onTrendingFinished, region =" << region
+             << ", HTTP status ="
              << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
     QString httpErrorMessage;
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
-        // Read the body even on error — YouTube usually returns a JSON
+        // Read the body even on error -- YouTube usually returns a JSON
         // error payload (error.code / error.message / error.status)
         // explaining *why* the request was rejected, which is far more
         // useful than the generic "Bad Request" Qt/HTTP reason phrase.
@@ -938,6 +974,13 @@ void YoutubeClient::onTrendingFinished()
         qDebug() << "[bbtube][trending] error:"
                  << (reply->error() ? reply->errorString() : httpErrorMessage);
         qDebug() << "[bbtube][trending] error response body =" << errorBody.left(2000);
+
+        if (canFallBack) {
+            reply->deleteLater();
+            requestTrending(chartType, TrendingRegions::fallbackCode(), true);
+            return;
+        }
+
         emit error(reply->error() ? reply->errorString() : httpErrorMessage);
         reply->deleteLater();
         return;
@@ -947,9 +990,17 @@ void YoutubeClient::onTrendingFinished()
     qDebug() << "[bbtube][trending] response length =" << response.length();
 
     TrendingData trendingData;
+    trendingData.region = region;
     TrendingPageParser::parse(&trendingData, &response);
 
     qDebug() << "[bbtube][trending] parsed videos.count() =" << trendingData.videos.count();
+
+    if (trendingData.videos.isEmpty() && canFallBack) {
+        // Region accepted but nothing to show (e.g. no Trending chart there).
+        reply->deleteLater();
+        requestTrending(chartType, TrendingRegions::fallbackCode(), true);
+        return;
+    }
 
     emit trendingDataReceived(trendingData);
     reply->deleteLater();
@@ -1001,18 +1052,82 @@ void YoutubeClient::applyInnerTubeHeaders(QNetworkRequest &request)
     request.setRawHeader("Referer", "https://www.youtube.com/");
 }
 
+// Attaches the signed-in Google/YouTube session to a WEB-client InnerTube
+// request (browse, etc). Returns false -- leaving the request untouched --
+// if the user isn't logged in, so callers fall back to anonymous.
+//
+// Mirrors what yt-dlp does for cookie auth (extractor/youtube/_base.py):
+//  - Cookie header with the stored session cookies
+//  - Authorization: SAPISIDHASH + SAPISID1PHASH + SAPISID3PHASH, each
+//    SHA1("<ts> <cookie> <origin>"), sharing one timestamp
+//  - Origin / X-Origin / X-Goog-AuthUser (first signed-in account)
+//
+// Qt detail: with the default CookieLoadControl (Automatic), QNetworkAccessManager
+// replaces any Cookie header we set with whatever is in its own cookie jar
+// for the URL -- and prepareRequest() puts SOCS/CONSENT consent cookies in
+// that jar for youtube.com, so the jar is never empty. Without switching to
+// Manual the session cookies below would silently never be sent.
+bool YoutubeClient::applyAuthHeaders(QNetworkRequest &request)
+{
+    GoogleAuthManager *auth = ApplicationUI::googleAuthManager;
+
+    QString cookieHeader = auth->cookieHeader();
+    if (cookieHeader.isEmpty()) {
+        return false;
+    }
+
+    QString sapisid = auth->cookieValue("SAPISID");
+    QString sapisid1p = auth->cookieValue("__Secure-1PAPISID");
+    QString sapisid3p = auth->cookieValue("__Secure-3PAPISID");
+    if (sapisid.isEmpty()) {
+        sapisid = sapisid3p; // YouTube itself falls back to 3PAPISID
+    }
+    if (sapisid.isEmpty() && sapisid1p.isEmpty() && sapisid3p.isEmpty()) {
+        return false;
+    }
+
+    // Keep the consent cookie alongside the session so a signed-in request
+    // doesn't trigger the GDPR consent interstitial.
+    if (!cookieHeader.contains("SOCS=")) {
+        cookieHeader += "; SOCS=CAESEwgDEgk0NTk4MjI4NTIaAmVuIAEaBgiA_LysBg";
+    }
+
+    qint64 timestamp = QDateTime::currentDateTime().toTime_t();
+    QStringList authorizations;
+    if (!sapisid.isEmpty()) {
+        authorizations << "SAPISIDHASH " + computeSapisidHashAt(timestamp, sapisid, INNERTUBE_AUTH_ORIGIN);
+    }
+    if (!sapisid1p.isEmpty()) {
+        authorizations << "SAPISID1PHASH " + computeSapisidHashAt(timestamp, sapisid1p, INNERTUBE_AUTH_ORIGIN);
+    }
+    if (!sapisid3p.isEmpty()) {
+        authorizations << "SAPISID3PHASH " + computeSapisidHashAt(timestamp, sapisid3p, INNERTUBE_AUTH_ORIGIN);
+    }
+
+    request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+    request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+    request.setRawHeader("Cookie", cookieHeader.toUtf8());
+    request.setRawHeader("Authorization", authorizations.join(" ").toUtf8());
+    request.setRawHeader("Origin", INNERTUBE_AUTH_ORIGIN.toUtf8());
+    request.setRawHeader("X-Origin", INNERTUBE_AUTH_ORIGIN.toUtf8());
+    request.setRawHeader("X-Goog-AuthUser", "0");
+
+    return true;
+}
+
 // Headers for charts.youtube.com requests — this is a different origin
 // from www.youtube.com, with its own client id/name, so it cannot reuse
 // applyInnerTubeHeaders() (which hardcodes the www.youtube.com origin and
 // the WEB client id "1"). Captured from the real browser request.
-void YoutubeClient::applyChartsHeaders(QNetworkRequest &request)
+void YoutubeClient::applyChartsHeaders(QNetworkRequest &request, const QString &region)
 {
     request.setRawHeader("User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0");
     request.setRawHeader("X-YouTube-Client-Name", CHARTS_CLIENT_ID.toUtf8());
     request.setRawHeader("X-YouTube-Client-Version", CHARTS_CLIENT_VERSION.toUtf8());
     request.setRawHeader("Origin", "https://charts.youtube.com");
-    request.setRawHeader("Referer", "https://charts.youtube.com/charts/TrendingVideos/us");
+    request.setRawHeader("Referer",
+            ("https://charts.youtube.com/charts/TrendingVideos/" + region).toUtf8());
 }
 
 // QNetworkReply::error() only flags network-level failures (DNS, timeout,

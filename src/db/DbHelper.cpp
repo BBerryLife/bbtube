@@ -228,6 +228,40 @@ void DbHelper::setDebugLogToFile(bool value)
     }
 }
 
+QString DbHelper::trendingRegion()
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("SELECT [Value] FROM Settings WHERE [Key] = 'trendingRegion';");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+
+    QSqlRecord rec = query.record();
+    query.next();
+
+    return query.value(rec.indexOf("Value")).toString();
+}
+
+void DbHelper::setTrendingRegion(QString value)
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("UPDATE Settings SET [Value] = :value WHERE [Key] = 'trendingRegion';");
+    query.bindValue(":value", value);
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+}
+
 QString DbHelper::defaultTab()
 {
     QSqlQuery query(getDbContext());

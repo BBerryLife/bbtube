@@ -34,6 +34,7 @@ private:
     TextField *playbackTimeoutTextField;
     DropDown *tabDropdown;
     DropDown *qualityDropdown;
+    DropDown *trendingRegionDropdown;
     ToggleButton *debugLogButton;
     Label *googleAccountStatusLabel;
     Button *googleAccountButton;

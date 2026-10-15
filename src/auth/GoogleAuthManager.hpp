@@ -65,6 +65,16 @@ public:
     // InnerTube requests. Returns "" if not logged in or not present.
     QString sapisid();
 
+    // Returns the value of a single cookie from the stored session by name
+    // (e.g. "__Secure-1PAPISID"), or "" if not logged in / not present.
+    QString cookieValue(const QString &name);
+
+    // True if the stored session contains the cookies YouTube itself needs
+    // to treat a request as signed in (LOGIN_INFO only exists on the
+    // youtube.com domain, so this is false for sessions captured before
+    // GoogleLoginSheet started visiting youtube.com).
+    bool hasYoutubeSession();
+
 signals:
     void loginStateChanged(bool loggedIn, QString email);
 

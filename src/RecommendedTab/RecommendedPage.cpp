@@ -10,6 +10,8 @@
 #include "src/VideoList/SearchListItemProvider.hpp"
 #include "src/utils/UIUtils.hpp"
 #include "src/utils/MiniPlayer.hpp"
+#include "src/applicationui.hpp"
+#include "src/auth/GoogleAuthManager.hpp"
 
 #include <bb/cascades/Page>
 #include <bb/cascades/Label>
@@ -74,6 +76,8 @@ RecommendedPage::RecommendedPage(bb::cascades::NavigationPane *navigationPane) :
             SLOT(onPlayAudioOnlyActionItemClick(QVariantList)));
     QObject::connect(listProvider, SIGNAL(channelActionItemClick(QVariantList)), this,
             SLOT(onChannelActionItemClick(QVariantList)));
+    QObject::connect(ApplicationUI::googleAuthManager, SIGNAL(loginStateChanged(bool, QString)),
+            this, SLOT(onLoginStateChanged(bool, QString)));
 
     bb::cascades::ActionItem *refreshActionItem = bb::cascades::ActionItem::create();
     refreshActionItem->setImageSource(QString("asset:///images/ic_reload.png"));
@@ -158,10 +162,26 @@ void RecommendedPage::onRecommendedDataReceived(RecommendedData data)
 
     if (recommendedData.videos.isEmpty()) {
         videoList->setVisible(false);
-        emptyFeedLabel->setText(
-                !recommendedData.emptyFeedMessage.isEmpty() ?
-                        recommendedData.emptyFeedMessage :
-                        "No recommendations available. Try Search or Trending instead.");
+
+        QString emptyMessage;
+        GoogleAuthManager *auth = ApplicationUI::googleAuthManager;
+        if (!auth->isLoggedIn()) {
+            // The home feed is personalized, so it is empty without an account.
+            emptyMessage = "Sign in with your Google account (Settings > Google Account) "
+                    "to see your recommendations.";
+        } else if (!auth->hasYoutubeSession()) {
+            // Session saved by an older version, before the login flow also
+            // collected the youtube.com cookies YouTube requires.
+            emptyMessage = "Your Google session is missing YouTube data. Log out in "
+                    "Settings and sign in again.";
+        } else if (!recommendedData.emptyFeedMessage.isEmpty()) {
+            emptyMessage = recommendedData.emptyFeedMessage;
+        } else {
+            emptyMessage = "No recommendations returned. If this keeps happening, log out "
+                    "in Settings and sign in again, or try Search or Trending.";
+        }
+
+        emptyFeedLabel->setText(emptyMessage);
         emptyFeedLabel->setVisible(true);
         overlay->setVisible(false);
         return;
@@ -219,6 +239,24 @@ void RecommendedPage::lazyLoad()
 {
     qDebug() << "[bbtube][RecommendedPage] lazyLoad() called, isLoaded =" << isLoaded;
     if (!isLoaded) {
+        onRefreshActionItemClick();
+    }
+}
+
+void RecommendedPage::onLoginStateChanged(bool loggedIn, QString email)
+{
+    Q_UNUSED(loggedIn);
+    Q_UNUSED(email);
+
+    // The feed on screen belongs to the previous account state. If this tab
+    // was already visited, reload right away; otherwise just make sure the
+    // next lazyLoad() (first time the tab is opened) fetches with the new
+    // session.
+    bool wasLoaded = isLoaded;
+    isLoaded = false;
+    recommendedData = RecommendedData();
+
+    if (wasLoaded) {
         onRefreshActionItemClick();
     }
 }

@@ -34,6 +34,7 @@ private slots:
     void onChannelActionItemClick(QVariantList);
     void onChannelDataReceived(ChannelPageData);
     void onSegmentedSelectedIndexChanged(int);
+    void onTrendingRegionChanged(QString region);
 private:
     QList<TrendingDataCategory> categories;
     CustomListView *videoList;

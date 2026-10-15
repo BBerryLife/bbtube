@@ -95,6 +95,7 @@ config_pri_assets {
         $$quote($$BASEDIR/assets/sql/Script000006.sql) \
         $$quote($$BASEDIR/assets/sql/Script000007.sql) \
         $$quote($$BASEDIR/assets/sql/Script000008.sql) \
+        $$quote($$BASEDIR/assets/sql/Script000009.sql) \
         $$quote($$BASEDIR/assets/youtube.db)
 }
 
@@ -221,6 +222,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/parser/trending/TrendingPageParser.hpp) \
         $$quote($$BASEDIR/src/settings/AppSettings.hpp) \
         $$quote($$BASEDIR/src/settings/SettingsSheet.hpp) \
+        $$quote($$BASEDIR/src/settings/TrendingRegions.hpp) \
         $$quote($$BASEDIR/src/utils/ActionItemService.hpp) \
         $$quote($$BASEDIR/src/utils/AudioTrackPicker.hpp) \
         $$quote($$BASEDIR/src/utils/BasePage.hpp) \

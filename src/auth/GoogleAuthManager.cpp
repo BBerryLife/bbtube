@@ -111,3 +111,17 @@ QString GoogleAuthManager::sapisid()
     }
     return extractCookieValue(header, "SAPISID");
 }
+
+QString GoogleAuthManager::cookieValue(const QString &name)
+{
+    QString header = cookieHeader();
+    if (header.isEmpty()) {
+        return "";
+    }
+    return extractCookieValue(header, name);
+}
+
+bool GoogleAuthManager::hasYoutubeSession()
+{
+    return !cookieValue("LOGIN_INFO").isEmpty();
+}

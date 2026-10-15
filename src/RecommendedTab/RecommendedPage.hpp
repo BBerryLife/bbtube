@@ -31,6 +31,7 @@ private slots:
     void onRefreshActionItemClick();
     void onChannelActionItemClick(QVariantList);
     void onChannelDataReceived(ChannelPageData);
+    void onLoginStateChanged(bool loggedIn, QString email);
 private:
     RecommendedData recommendedData;
     CustomListView *videoList;

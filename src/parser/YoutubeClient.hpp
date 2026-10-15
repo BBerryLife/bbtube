@@ -66,7 +66,9 @@ private:
 
     QNetworkRequest prepareRequest(QString url);
     void applyInnerTubeHeaders(QNetworkRequest &request);
-    void applyChartsHeaders(QNetworkRequest &request);
+    bool applyAuthHeaders(QNetworkRequest &request);
+    void applyChartsHeaders(QNetworkRequest &request, const QString &region);
+    void requestTrending(const QString &chartType, const QString &region, bool isFallback);
     bool hasHttpError(QNetworkReply *reply, QString *errorMessage);
     QString extractBaseJsUrl(const QString &html);
     QString getJson(QString response);

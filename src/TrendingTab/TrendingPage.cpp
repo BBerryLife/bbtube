@@ -1,4 +1,6 @@
 #include "TrendingPage.hpp"
+#include "src/applicationui.hpp"
+#include "src/settings/TrendingRegions.hpp"
 #include "src/PlayerPage/PlayerPage.hpp"
 #include "src/ChannelPage/ChannelPage.hpp"
 #include "src/parser/YoutubeClient.hpp"
@@ -58,6 +60,8 @@ TrendingPage::TrendingPage(bb::cascades::NavigationPane *navigationPane) :
             SLOT(onTrendingDataReceived(TrendingData)));
     QObject::connect(youtubeClient, SIGNAL(channelDataReceived(ChannelPageData)), this,
             SLOT(onChannelDataReceived(ChannelPageData)));
+    QObject::connect(ApplicationUI::appSettings, SIGNAL(trendingRegionChanged(QString)), this,
+            SLOT(onTrendingRegionChanged(QString)));
     QObject::connect(videoList, SIGNAL(triggered(QVariantList)), this,
             SLOT(onListItemClick(QVariantList)));
     QObject::connect(listProvider, SIGNAL(playAudioOnlyActionItemClick(QVariantList)), this,
@@ -146,8 +150,27 @@ void TrendingPage::lazyLoad()
     }
 }
 
+void TrendingPage::onTrendingRegionChanged(QString region)
+{
+    Q_UNUSED(region);
+
+    // Lists on screen/cached belong to the old region. Reload now if the
+    // tab was already visited, otherwise lazyLoad() will fetch the new
+    // region the first time it's opened.
+    bool wasLoaded = isLoaded;
+    isLoaded = false;
+    modelsMap.clear();
+
+    if (wasLoaded) {
+        onRefreshActionItemClick();
+    }
+}
+
 void TrendingPage::onTrendingDataReceived(TrendingData data)
 {
+    QString regionName = TrendingRegions::nameFor(data.region);
+    setTitle(regionName.isEmpty() ? QString("Trending") : "Trending - " + regionName);
+
     QListDataModel<VideoListItemModel*> *model = new QListDataModel<VideoListItemModel*>();
     for (int i = 0; i < data.videos.count(); i++) {
         VideoListItemModel *item = VideoListItemModel::mapVideo(&data.videos[i]);
