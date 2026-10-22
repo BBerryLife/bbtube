@@ -931,7 +931,13 @@ void PlayerPage::startPlaybackAt(QString url, int offsetMs, bool partial)
 
 // How early (seconds before the loaded file runs out) the next, longer merged
 // file is requested. It grows with how long the last merge took.
-static const double REMUX_SWAP_LEAD_BASE_SECONDS = 4.0;
+static const double REMUX_SWAP_LEAD_BASE_SECONDS = 6.0;
+// lead = BASE + FACTOR * (duration of the last merge), at most MAX: a merge of tens of MB can take 2-4 s on the
+// device and a bigger target gain makes the files bigger, so the next file is asked for a little earlier than
+// before (4 + 2x, max 30) -- it has to exist BEFORE the player reaches the end of the loaded file, or the player is
+// held (paused, spinner) until it does.
+static const double REMUX_SWAP_LEAD_MERGE_FACTOR = 2.5;
+static const double REMUX_SWAP_LEAD_MAX_SECONDS = 40.0;
 // A quality switch only takes over once the new file reaches this far past
 // the current position (so the switch doesn't immediately run dry).
 static const double REMUX_QUALITY_SWITCH_AHEAD_SECONDS = 8.0;
@@ -981,9 +987,13 @@ static const int FREEZE_UNKNOWN_MIN_MS = 2300;
 // this much video beyond the current file's end. The requirement starts low
 // (the first swaps come soon after starting, when waiting would look like a
 // hang) and grows with every swap up to the target.
+// The requirement grows geometrically (each swap asks REMUX_SWAP_GAIN_GROWTH times the previous one): 10, 16, 26,
+// then the target. Linear growth reached the old 24 s target only after 3 swaps and then swapped every ~24 s, i.e.
+// ~25 swaps (25 black pictures) for a 10 min video. ~40 s is about what a 20 MB merged file (REMUX_MERGE_MAX_BYTES)
+// holds at 720p next to the 30 s kept behind the playhead, so it is also the practical ceiling.
 static const double REMUX_SWAP_FIRST_GAIN_SECONDS = 10.0;
-static const double REMUX_SWAP_GAIN_STEP_SECONDS = 7.0;
-static const double REMUX_SWAP_TARGET_GAIN_SECONDS = 24.0;
+static const double REMUX_SWAP_GAIN_GROWTH = 1.6;
+static const double REMUX_SWAP_TARGET_GAIN_SECONDS = 40.0;
 // ...unless the player has already been held at the end of its file (paused,
 // loading indicator on top) for this long: then it gets whatever there is.
 static const int REMUX_SWAP_HOLD_MAX_MS = 8000;
@@ -1340,8 +1350,8 @@ void PlayerPage::maybeRequestRemuxMerge()
     unsigned int posMs = (unsigned int) playerContext->getPosition();
     if (lastPositionMs > posMs) posMs = lastPositionMs;
     double posSec = posMs / 1000.0;
-    double lead = REMUX_SWAP_LEAD_BASE_SECONDS + 2.0 * remuxLastMergeSeconds;
-    if (lead > 30.0) lead = 30.0;
+    double lead = REMUX_SWAP_LEAD_BASE_SECONDS + REMUX_SWAP_LEAD_MERGE_FACTOR * remuxLastMergeSeconds;
+    if (lead > REMUX_SWAP_LEAD_MAX_SECONDS) lead = REMUX_SWAP_LEAD_MAX_SECONDS;
 
     // The file in the player: extend it when it is about to run out.
     ChunkedRemuxSession *ps = playingSession();
@@ -1352,7 +1362,10 @@ void PlayerPage::maybeRequestRemuxMerge()
         if (storedEnd > end && remuxPlayableSeconds - posSec < lead) {
             // Time to decide whether the next file is worth a swap.
             double gain = ps->chunkEndSeconds(storedEnd - 1) - remuxPlayableSeconds;
-            double minGain = REMUX_SWAP_FIRST_GAIN_SECONDS + REMUX_SWAP_GAIN_STEP_SECONDS * swapCount;
+            double minGain = REMUX_SWAP_FIRST_GAIN_SECONDS;
+            for (int i = 0; i < swapCount && minGain < REMUX_SWAP_TARGET_GAIN_SECONDS; ++i) {
+                minGain *= REMUX_SWAP_GAIN_GROWTH;
+            }
             if (minGain > REMUX_SWAP_TARGET_GAIN_SECONDS) minGain = REMUX_SWAP_TARGET_GAIN_SECONDS;
             bool toVideoEnd = storedEnd >= ps->chunkCount() || ps->isDownloadComplete();
             bool holdExpired = remuxBufferPaused && remuxHoldClock.elapsed() >= REMUX_SWAP_HOLD_MAX_MS;
