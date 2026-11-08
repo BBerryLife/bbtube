@@ -228,6 +228,28 @@ bool InvidiousClient::hasUsableStreams(const QVariantMap &videoMap)
     return false;
 }
 
+// Invidious gives lengthSeconds as an integer; the rest of the app (list item
+// labels, SingleVideoMetadata) expects a formatted "m:ss" / "h:mm:ss" string.
+// Never returns "" (that means "live stream" to SingleVideoMetadata), so a
+// missing/zero duration becomes "0:00".
+static QString formatLengthSeconds(int totalSeconds)
+{
+    if (totalSeconds < 0) {
+        totalSeconds = 0;
+    }
+
+    int hours = totalSeconds / 3600;
+    int minutes = (totalSeconds % 3600) / 60;
+    int seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return QString("%1:%2:%3").arg(hours)
+                .arg(minutes, 2, 10, QChar('0'))
+                .arg(seconds, 2, 10, QChar('0'));
+    }
+    return QString("%1:%2").arg(minutes).arg(seconds, 2, 10, QChar('0'));
+}
+
 void InvidiousClient::mapToVideoMetadata(const QVariantMap &videoMap, VideoMetadata *outMetadata)
 {
     SingleVideoMetadata video;
@@ -245,7 +267,7 @@ void InvidiousClient::mapToVideoMetadata(const QVariantMap &videoMap, VideoMetad
     // liveNow (checked separately, see mapToStorageData) is what actually
     // drives live-stream handling in StorageData/PlayerPage.
     bool liveNow = videoMap["liveNow"].toBool();
-    video.lengthText = liveNow ? "" : QString::number(videoMap["lengthSeconds"].toInt());
+    video.lengthText = liveNow ? "" : formatLengthSeconds(videoMap["lengthSeconds"].toInt());
     video.viewsCount = QString::number(videoMap["viewCount"].toLongLong());
     video.shortViewsCount = video.viewsCount;
     video.dateUploadedAgo = videoMap["publishedText"].toString();
@@ -269,7 +291,7 @@ void InvidiousClient::mapToVideoMetadata(const QVariantMap &videoMap, VideoMetad
         relatedVideo.channelTitle = rec["author"].toString();
         relatedVideo.shortViewsCount = rec["viewCountText"].toString();
         relatedVideo.viewsCount = relatedVideo.shortViewsCount;
-        relatedVideo.lengthText = QString::number(rec["lengthSeconds"].toInt());
+        relatedVideo.lengthText = formatLengthSeconds(rec["lengthSeconds"].toInt());
 
         QVariantList recThumbnails = rec["videoThumbnails"].toList();
         if (!recThumbnails.isEmpty()) {

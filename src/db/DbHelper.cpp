@@ -262,6 +262,40 @@ void DbHelper::setTrendingRegion(QString value)
     }
 }
 
+bool DbHelper::isFirstRunDialogShown()
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("SELECT [Value] FROM Settings WHERE [Key] = 'firstRunDialogShown';");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+
+    QSqlRecord rec = query.record();
+    query.next();
+
+    return query.value(rec.indexOf("Value")).toString() == "1";
+}
+
+void DbHelper::setFirstRunDialogShown(bool value)
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("UPDATE Settings SET [Value] = :value WHERE [Key] = 'firstRunDialogShown';");
+    query.bindValue(":value", value ? "1" : "0");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+}
+
 QString DbHelper::defaultTab()
 {
     QSqlQuery query(getDbContext());

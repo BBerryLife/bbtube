@@ -3,6 +3,8 @@
 #include "src/applicationui.hpp"
 
 #include <bb/cascades/Page>
+#include <bb/cascades/ScrollView>
+#include <bb/cascades/ScrollViewProperties>
 #include <bb/cascades/TitleBar>
 #include <bb/cascades/ActionItem>
 #include <bb/cascades/WebStorage>
@@ -41,7 +43,15 @@ GoogleLoginSheet::GoogleLoginSheet() :
     titleBar->setDismissAction(cancelAction);
 
     content->setTitleBar(titleBar);
-    content->setContent(webView);
+    // A bare WebView as the page content doesn't scroll on BB10 -- wrap it in
+    // a ScrollView (both axes + pinch-to-zoom) so the Google login pages,
+    // which are taller than the screen, can actually be scrolled.
+    ScrollView *scrollView = new ScrollView();
+    scrollView->scrollViewProperties()->setScrollMode(ScrollMode::Both);
+    scrollView->scrollViewProperties()->setPinchToZoomEnabled(true);
+    scrollView->setContent(webView);
+
+    content->setContent(scrollView);
     this->setContent(content);
 
     open();

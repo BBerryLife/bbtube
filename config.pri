@@ -96,6 +96,7 @@ config_pri_assets {
         $$quote($$BASEDIR/assets/sql/Script000007.sql) \
         $$quote($$BASEDIR/assets/sql/Script000008.sql) \
         $$quote($$BASEDIR/assets/sql/Script000009.sql) \
+        $$quote($$BASEDIR/assets/sql/Script000010.sql) \
         $$quote($$BASEDIR/assets/youtube.db)
 }
 

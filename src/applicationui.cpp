@@ -21,6 +21,7 @@
 #include <bb/cascades/LocaleHandler>
 #include <bb/system/InvokeManager>
 #include <bb/system/InvokeRequest>
+#include <bb/system/SystemDialog>
 #include <bb/cascades/TabbedPane>
 
 #include <QFuture>
@@ -129,6 +130,46 @@ ApplicationUI::ApplicationUI() :
     if (isLazyLoad) {
         activeTab->activePage()->lazyLoad();
     }
+
+    showFirstRunDialog();
+}
+
+void ApplicationUI::showFirstRunDialog()
+{
+    // Only on the very first launch; also skip if the user is already
+    // signed in (e.g. upgrading from a build that predates this flag).
+    if (appSettings->isFirstRunDialogShown()) {
+        return;
+    }
+
+    appSettings->setFirstRunDialogShown(true);
+
+    if (googleAuthManager->isLoggedIn()) {
+        return;
+    }
+
+    bb::system::SystemDialog *dialog = new bb::system::SystemDialog(tr("OK"));
+    dialog->setTitle(tr("Sign in to Google"));
+    dialog->setBody(
+            tr("Please sign in to your Google account in Settings: swipe down from the top of the "
+               "screen, tap Settings, then scroll down to find the Google sign-in button.\n\n"
+               "After signing in, you will be taken to youtube.com. Please don't tap Cancel yet - "
+               "once your account information has been captured, the page will close automatically."));
+    dialog->cancelButton()->setLabel(QString());
+
+    bool success = connect(dialog, SIGNAL(finished(bb::system::SystemUiResult::Type)), this,
+            SLOT(onFirstRunDialogFinished(bb::system::SystemUiResult::Type)));
+
+    if (success) {
+        dialog->show();
+    } else {
+        dialog->deleteLater();
+    }
+}
+
+void ApplicationUI::onFirstRunDialogFinished(bb::system::SystemUiResult::Type)
+{
+    sender()->deleteLater();
 }
 
 void ApplicationUI::onSystemLanguageChanged()

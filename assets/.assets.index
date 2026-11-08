@@ -1,5 +1,5 @@
 1
-61
+62
 cc.xml
 images/ic_add_bookmarks.png
 images/ic_backward_10.png
@@ -60,4 +60,5 @@ sql/Script000006.sql
 sql/Script000007.sql
 sql/Script000008.sql
 sql/Script000009.sql
+sql/Script000010.sql
 youtube.db

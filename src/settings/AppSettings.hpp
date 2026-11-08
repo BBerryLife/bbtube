@@ -18,6 +18,7 @@ public:
         quality = DbHelper::defaultQuality();
         debugLogToFile = DbHelper::isDebugLogToFile();
         trendingRegionCode = DbHelper::trendingRegion();
+        firstRunDialogShown = DbHelper::isFirstRunDialogShown();
     }
     ~AppSettings()
     {
@@ -106,6 +107,17 @@ public:
             }
         }
     }
+    bool isFirstRunDialogShown()
+    {
+        return firstRunDialogShown;
+    }
+    void setFirstRunDialogShown(bool value)
+    {
+        if (firstRunDialogShown != value) {
+            firstRunDialogShown = value;
+            DbHelper::setFirstRunDialogShown(value);
+        }
+    }
 signals:
     void trendingRegionChanged(QString value);
     void autoplayChanged(bool value);
@@ -118,6 +130,7 @@ private:
     QString quality;
     bool debugLogToFile;
     QString trendingRegionCode;
+    bool firstRunDialogShown;
 };
 
 #endif /* APPSETTINGS_HPP_ */

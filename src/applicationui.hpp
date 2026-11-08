@@ -17,6 +17,7 @@
 #include <bb/cascades/Page>
 #include <bb/cascades/NavigationPane>
 #include <bb/system/InvokeRequest>
+#include <bb/system/SystemUiResult>
 #include <bb/cascades/TabbedPane>
 
 #include <audio/audio_manager_event.h>
@@ -50,7 +51,10 @@ public:
     void onActiveTabChanged(bb::cascades::Tab*);
     void onAboutToQuit();
     void processAudioManagerEvents();
+    void onFirstRunDialogFinished(bb::system::SystemUiResult::Type type);
 private:
+    void showFirstRunDialog();
+
     QTranslator* m_pTranslator;
     bb::cascades::LocaleHandler* m_pLocaleHandler;
 
